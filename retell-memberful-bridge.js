@@ -6,18 +6,25 @@ import express from "express";
 import Retell from "retell-sdk";
 
 const app = express();
-app.use(express.json());
+// Raw body so Retell signature verification is exact
+app.use(express.raw({ type: "application/json" }));
 
 const MEMBERFUL_URL = "https://aristotlesignals.memberful.com/api/graphql";
 
 // Verify the request actually came from Retell
 function verifyRetell(req, res, next) {
+  const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : "";
   const ok = Retell.verify(
-    JSON.stringify(req.body),
-    process.env.RETELL_API_KEY,
+    raw,
+    process.env.RETELL_API_KEY, // the key with the webhook badge
     req.headers["x-retell-signature"]
   );
   if (!ok) return res.status(401).json({ error: "unauthorized" });
+  try {
+    req.body = JSON.parse(raw);
+  } catch {
+    return res.status(400).json({ error: "bad json" });
+  }
   next();
 }
 
