@@ -75,14 +75,39 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
     const subs = m.subscriptions || [];
     const active = subs.filter((s) => s.active);
 
+    // Memberful returns Unix timestamps in seconds; turn them into spoken dates
+    const day = (t) =>
+      t
+        ? new Date(t * 1000).toLocaleDateString("en-US", {
+            month: "long",
+            day: "numeric",
+            year: "numeric",
+            timeZone: "America/New_York",
+          })
+        : null;
+
+    // Most recent subscription, so Riya can explain an ended trial or plan
+    const latest = [...subs].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+
     // Only return what the agent needs to say out loud. No billing details.
     res.json({
       result: {
         found: true,
         name: m.fullName,
-        active_plans: active.map((s) => s.plan?.name),
+        has_active_plan: active.length > 0,
+        active_plans: active.map((s) => ({
+          plan: s.plan?.name,
+          renews_or_ends_on: day(s.expiresAt),
+        })),
         active_subscription_count: active.length, // >1 can explain double billing
-        renews_or_expires: active[0]?.expiresAt || null,
+        most_recent_plan: latest
+          ? {
+              plan: latest.plan?.name,
+              active: latest.active,
+              started_on: day(latest.createdAt),
+              ends_or_ended_on: day(latest.expiresAt),
+            }
+          : null,
       },
     });
   } catch (e) {
