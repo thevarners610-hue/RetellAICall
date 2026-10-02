@@ -134,11 +134,10 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
 const HUBSPOT = "https://api.hubapi.com";
 const MAX_EMAILS = 5;
 
-// CONFIRM the mutation name and argument in Memberful's API Explorer
-// (Documentation Explorer -> Mutation -> search "member") before using Delete.
+// Confirmed in Memberful's API Explorer: memberDelete(id: ID!) -> MemberDeletePayload { id }
 const DELETE_MEMBER =
   process.env.MEMBERFUL_DELETE_MUTATION ||
-  `mutation ($id: ID!) { memberDelete(id: $id) { __typename } }`;
+  `mutation ($id: ID!) { memberDelete(id: $id) { id } }`;
 
 // Verify HubSpot's v3 webhook signature
 function verifyHubSpot(req) {
@@ -245,6 +244,8 @@ async function runCleanup(ticketId, mode) {
       const del = await memberful(DELETE_MEMBER, { id: m.id });
       if (del.errors) {
         lines.push(`${email}: DELETE FAILED (${del.errors[0]?.message}).`);
+      } else if (!del.data?.memberDelete?.id) {
+        lines.push(`${email}: DELETE NOT CONFIRMED, Memberful didn't return the deleted id. Check this account by hand.`);
       } else {
         lines.push(`${email}: DELETED member #${m.id} (${m.fullName || "no name"}).`);
       }
