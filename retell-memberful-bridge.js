@@ -2,9 +2,14 @@
 //  - /lookup-member: read-only lookup for Riya (Retell custom function)
 //  - /hubspot/duplicate-cleanup: team-only cleanup of duplicate Memberful
 //    accounts, triggered from a HubSpot ticket property (Riya can't reach it)
+//  - /send-link-text: Riya texts the caller a fixed link via a Zapier -> SlickText Zap
+//  - Trial sync (hourly): copies Memberful trial end dates to HubSpot contacts
+//    so a HubSpot workflow can send a reminder before the trial converts
 // Deploy on Railway. Env vars:
 //   RETELL_API_KEY, MEMBERFUL_API_KEY,
-//   HUBSPOT_TOKEN, HUBSPOT_CLIENT_SECRET
+//   HUBSPOT_TOKEN, HUBSPOT_CLIENT_SECRET,
+//   ZAPIER_SMS_HOOK_URL, ZAPIER_SMS_TOKEN,
+//   ADMIN_TOKEN (optional, lets you trigger the trial sync on demand)
 // npm i express retell-sdk
 
 import crypto from "node:crypto";
@@ -119,6 +124,80 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.json({ result: "Lookup is unavailable right now. Take their details and escalate." });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Riya texts a link (Retell custom function: send_link_text, args: { link_type })
+// Guardrails: only texts the number that is calling (from Retell's call data,
+// never from anything Riya says), fixed link types only, one text per call.
+// ---------------------------------------------------------------------------
+
+const LINK_TYPES = [
+  "account_sign_in",
+  "discord_reconnect",
+  "support_ticket",
+  "apparel_store",
+  "affiliate_signup",
+  "all_links",
+];
+const textedCalls = new Map(); // call_id -> time sent
+
+function toTenDigit(e164) {
+  const digits = (e164 || "").replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  if (digits.length === 10) return digits;
+  return "";
+}
+
+app.post("/send-link-text", verifyRetell, async (req, res) => {
+  const call = req.body?.call || {};
+  const linkType = String(req.body?.args?.link_type || "").toLowerCase();
+
+  if (!LINK_TYPES.includes(linkType)) {
+    return res.json({ result: "Unknown link type. Offer to email the link instead." });
+  }
+
+  // Inbound calls: the caller is from_number. Web test calls have no number.
+  const phone = call.direction === "outbound" ? call.to_number : call.from_number;
+  const tenDigit = toTenDigit(phone);
+  if (!tenDigit) {
+    return res.json({
+      result: "Can't text this caller (no US phone number on the call). Offer to email the link instead.",
+    });
+  }
+
+  const callId = call.call_id || "";
+  if (callId && textedCalls.has(callId)) {
+    return res.json({
+      result: "A text was already sent on this call. Only one text per call. If they need more links, offer the All links email.",
+    });
+  }
+
+  try {
+    const r = await fetch(process.env.ZAPIER_SMS_HOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: process.env.ZAPIER_SMS_TOKEN,
+        link_type: linkType,
+        phone_e164: phone,
+        phone_10: tenDigit,
+        call_id: callId,
+      }),
+    });
+    if (!r.ok) throw new Error(`Zapier hook ${r.status}`);
+    if (callId) textedCalls.set(callId, Date.now());
+
+    // Forget old calls so memory doesn't grow
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [id, t] of textedCalls) if (t < dayAgo) textedCalls.delete(id);
+
+    res.json({ result: "Text sent to the caller's phone. Tell them it should arrive in a moment." });
+  } catch (e) {
+    console.error("send-link-text failed:", e);
+    res.json({ result: "The text didn't go through. Offer to email the link instead." });
   }
 });
 
@@ -291,6 +370,110 @@ app.post("/hubspot/duplicate-cleanup", (req, res) => {
       console.error("Duplicate cleanup failed:", err)
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Memberful -> HubSpot trial sync
+// Every hour: reads the newest Memberful subscriptions (back ~8 days), and for
+// every trial that hasn't ended yet, upserts the HubSpot contact (by email) with:
+//   trial_end_date   (date, Puerto Rico calendar day the trial converts)
+//   trial_plan       (plan name)
+//   trial_auto_renew ("true" if still set to convert, "false" if canceled)
+// Read-only on Memberful. Only writes those three HubSpot contact properties.
+// ---------------------------------------------------------------------------
+
+const TRIAL_SYNC_EVERY_MS = 60 * 60 * 1000;
+const PR_OFFSET_SECONDS = 4 * 3600; // Puerto Rico is UTC-4 all year
+
+// HubSpot date properties want midnight UTC of the calendar day
+function prDateMs(unixSeconds) {
+  const d = new Date((unixSeconds - PR_OFFSET_SECONDS) * 1000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+const RECENT_SUBS = `
+  query ($before: String) {
+    subscriptions(last: 100, before: $before) {
+      pageInfo { startCursor hasPreviousPage }
+      edges { node { active autorenew createdAt trialEndAt plan { name } member { email } } }
+    }
+  }`;
+
+async function fetchOpenTrials() {
+  const now = Math.floor(Date.now() / 1000);
+  const createdCutoff = now - 8 * 86400; // trials are 7 days, so look back 8
+  const trials = [];
+  let before = null;
+
+  for (let page = 0; page < 10; page++) {
+    const { data, errors } = await memberful(RECENT_SUBS, { before });
+    if (errors) throw new Error(`Memberful: ${errors[0]?.message}`);
+    const conn = data?.subscriptions;
+    const nodes = (conn?.edges || []).map((e) => e.node);
+    if (!nodes.length) break;
+
+    for (const n of nodes) {
+      const email = (n.member?.email || "").trim().toLowerCase();
+      if (!n.trialEndAt || !email || email.startsWith("test@")) continue;
+      if (n.trialEndAt < now - 86400) continue; // already ended
+      trials.push({ ...n, email });
+    }
+
+    const oldest = Math.min(...nodes.map((n) => n.createdAt || now));
+    if (!conn.pageInfo?.hasPreviousPage || oldest < createdCutoff) break;
+    before = conn.pageInfo.startCursor;
+  }
+
+  // One row per email: keep the trial that ends last
+  const byEmail = new Map();
+  for (const t of trials) {
+    const prev = byEmail.get(t.email);
+    if (!prev || t.trialEndAt > prev.trialEndAt) byEmail.set(t.email, t);
+  }
+  return [...byEmail.values()];
+}
+
+let trialSyncRunning = false;
+async function syncTrialsToHubSpot() {
+  if (trialSyncRunning) return { skipped: true };
+  trialSyncRunning = true;
+  try {
+    const trials = await fetchOpenTrials();
+    let upserted = 0;
+    for (let i = 0; i < trials.length; i += 100) {
+      const inputs = trials.slice(i, i + 100).map((t) => ({
+        idProperty: "email",
+        id: t.email,
+        properties: {
+          email: t.email,
+          trial_end_date: String(prDateMs(t.trialEndAt)),
+          trial_plan: t.plan?.name || "",
+          trial_auto_renew: t.active && t.autorenew ? "true" : "false",
+        },
+      }));
+      await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", { inputs });
+      upserted += inputs.length;
+    }
+    console.log(`Trial sync: ${upserted} trial contacts updated in HubSpot`);
+    return { upserted };
+  } catch (e) {
+    console.error("Trial sync failed:", e);
+    return { error: String(e.message || e) };
+  } finally {
+    trialSyncRunning = false;
+  }
+}
+
+// Run shortly after startup, then every hour
+setTimeout(syncTrialsToHubSpot, 15 * 1000);
+setInterval(syncTrialsToHubSpot, TRIAL_SYNC_EVERY_MS);
+
+// Optional: run it on demand with  POST /admin/sync-trials  (header x-admin-token)
+app.post("/admin/sync-trials", async (req, res) => {
+  if (!process.env.ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  res.json(await syncTrialsToHubSpot());
 });
 
 app.listen(process.env.PORT || 3000);
