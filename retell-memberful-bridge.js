@@ -3,13 +3,17 @@
 //  - /hubspot/duplicate-cleanup: team-only cleanup of duplicate Memberful
 //    accounts, triggered from a HubSpot ticket property (Riya can't reach it)
 //  - /send-link-text: Riya texts the caller a fixed link via a Zapier -> SlickText Zap
+//  - Daily dispute alert (9 AM Puerto Rico): posts Stripe disputes that need a
+//    response soon as a phone/computer push notification and/or email
 //  - Trial sync (hourly): copies Memberful trial end dates to HubSpot contacts
 //    so a HubSpot workflow can send a reminder before the trial converts
 // Deploy on Railway. Env vars:
 //   RETELL_API_KEY, MEMBERFUL_API_KEY,
 //   HUBSPOT_TOKEN, HUBSPOT_CLIENT_SECRET,
 //   ZAPIER_SMS_HOOK_URL, ZAPIER_SMS_TOKEN,
-//   ADMIN_TOKEN (optional, lets you trigger the trial sync on demand)
+//   ADMIN_TOKEN (optional, lets you trigger the trial sync / dispute alert on demand),
+//   STRIPE_DISPUTES_KEY (restricted key, Disputes: Read),
+//   ALERT_NTFY_TOPIC (phone/computer push) and/or ALERT_EMAIL_HOOK (Zapier hook -> Gmail)
 // npm i express retell-sdk
 
 import crypto from "node:crypto";
@@ -474,6 +478,129 @@ app.post("/admin/sync-trials", async (req, res) => {
     return res.status(401).json({ error: "unauthorized" });
   }
   res.json(await syncTrialsToHubSpot());
+});
+
+// ---------------------------------------------------------------------------
+// Daily Stripe dispute alert -> push notification and/or email
+// Every day at 9 AM Puerto Rico time, lists disputes that still need a response,
+// soonest deadline first, flagging anything due within 48 hours.
+// Read-only on Stripe (use a restricted key with Disputes: Read only).
+// ---------------------------------------------------------------------------
+
+const ALERT_HOUR_PR = 9;
+let lastAlertDay = "";
+
+function prNow() {
+  return new Date(Date.now() - PR_OFFSET_SECONDS * 1000); // UTC fields = PR wall clock
+}
+function prLabel(unixSeconds) {
+  const d = new Date((unixSeconds - PR_OFFSET_SECONDS) * 1000);
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  let h = d.getUTCHours(); const ampm = h >= 12 ? "PM" : "AM"; h = h % 12 || 12;
+  const m = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${days[d.getUTCDay()]} ${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${h}:${m} ${ampm}`;
+}
+
+async function fetchOpenDisputes() {
+  const open = [];
+  let startingAfter = null;
+  for (let page = 0; page < 10; page++) {
+    const qs = new URLSearchParams({ limit: "100" });
+    if (startingAfter) qs.set("starting_after", startingAfter);
+    const r = await fetch(`https://api.stripe.com/v1/disputes?${qs}`, {
+      headers: { Authorization: `Bearer ${process.env.STRIPE_DISPUTES_KEY}` },
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(`Stripe ${r.status}: ${body?.error?.message}`);
+    for (const d of body.data || []) {
+      if (["needs_response", "warning_needs_response"].includes(d.status) && d.evidence_details?.due_by) {
+        open.push(d);
+      }
+    }
+    if (!body.has_more || !body.data?.length) break;
+    startingAfter = body.data[body.data.length - 1].id;
+  }
+  return open.sort((a, b) => a.evidence_details.due_by - b.evidence_details.due_by);
+}
+
+async function sendDisputeAlert() {
+  const push = process.env.ALERT_NTFY_TOPIC;
+  const emailHook = process.env.ALERT_EMAIL_HOOK;
+  if (!process.env.STRIPE_DISPUTES_KEY || (!push && !emailHook)) {
+    return { skipped: "Set STRIPE_DISPUTES_KEY plus ALERT_NTFY_TOPIC and/or ALERT_EMAIL_HOOK" };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const open = (await fetchOpenDisputes()).filter((d) => d.evidence_details.due_by > now);
+  const urgent = open.filter((d) => d.evidence_details.due_by - now <= 48 * 3600);
+  const total = open.reduce((s, d) => s + d.amount, 0) / 100;
+
+  const line = (d) => {
+    const ev = d.evidence || {};
+    const drafted = d.evidence_details?.has_evidence ? "draft saved" : "NO DRAFT";
+    return `- ${ev.customer_name || ev.customer_email_address || "Unknown"}: $${(d.amount / 100).toFixed(2)} (${d.reason.replace(/_/g, " ")}), due ${prLabel(d.evidence_details.due_by)} [${drafted}]\n  https://dashboard.stripe.com/disputes/${d.id}`;
+  };
+
+  const title = urgent.length
+    ? `${urgent.length} Stripe dispute${urgent.length > 1 ? "s" : ""} due within 48 hours`
+    : `Stripe disputes: nothing due in the next 48 hours`;
+
+  let body = `${open.length} disputes need a response ($${total.toFixed(2)} at stake).\n`;
+  if (urgent.length) body += `\nDUE IN THE NEXT 48 HOURS:\n` + urgent.map(line).join("\n") + "\n";
+  const upcoming = open.filter((d) => !urgent.includes(d)).slice(0, 5);
+  if (upcoming.length) body += `\nCOMING UP NEXT:\n` + upcoming.map(line).join("\n") + "\n";
+  body += `\nAsk Claude to "draft the disputes due next," then review and submit in Stripe before the deadline.`;
+
+  const results = {};
+
+  // Push notification to phone + computer (ntfy app / ntfy.sh in a browser)
+  if (push) {
+    const short = urgent.length
+      ? urgent.map((d) => `${d.evidence?.customer_name || "Unknown"} $${(d.amount / 100).toFixed(0)}, due ${prLabel(d.evidence_details.due_by)}${d.evidence_details?.has_evidence ? "" : " (no draft)"}`).join("\n")
+      : `${open.length} open, next due ${open[0] ? prLabel(open[0].evidence_details.due_by) : "n/a"}`;
+    const r = await fetch(`https://ntfy.sh/${encodeURIComponent(push)}`, {
+      method: "POST",
+      headers: {
+        Title: title,
+        Priority: urgent.length ? "high" : "default",
+        Tags: urgent.length ? "rotating_light" : "credit_card",
+        Click: "https://dashboard.stripe.com/disputes",
+      },
+      body: short,
+    });
+    results.push = r.status;
+  }
+
+  // Email (Zapier Catch Hook -> Gmail "Send Email")
+  if (emailHook) {
+    const r = await fetch(emailHook, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subject: title, text: body, urgent_count: urgent.length, open_count: open.length }),
+    });
+    results.email = r.status;
+  }
+
+  console.log(`Dispute alert sent: ${open.length} open, ${urgent.length} urgent`, results);
+  return { open: open.length, urgent: urgent.length, ...results };
+}
+
+// Check every 10 minutes; send once per day at 9 AM Puerto Rico time
+setInterval(async () => {
+  const pr = prNow();
+  const day = pr.toISOString().slice(0, 10);
+  if (pr.getUTCHours() === ALERT_HOUR_PR && lastAlertDay !== day) {
+    lastAlertDay = day;
+    try { await sendDisputeAlert(); } catch (e) { console.error("Dispute alert failed:", e); }
+  }
+}, 10 * 60 * 1000);
+
+// Optional: send it right now with  POST /admin/dispute-alert  (header x-admin-token)
+app.post("/admin/dispute-alert", async (req, res) => {
+  if (!process.env.ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  try { res.json(await sendDisputeAlert()); } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 app.listen(process.env.PORT || 3000);
