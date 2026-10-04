@@ -863,6 +863,13 @@ async function planTicket(ticket) {
   const from = (lastIncoming.senders || []).find((x) => x.deliveryIdentifier?.value);
   if (!from) return { action: "skip", reason: "no sender email on the thread" };
 
+  // Only email people who have (or had) a Memberful account; vendors and spam just get closed
+  const toEmail = String(from.deliveryIdentifier.value).trim().toLowerCase();
+  if (process.env.BACKLOG_REQUIRE_MEMBER !== "false") {
+    const { data } = await memberful(`query ($email: String!) { memberByEmail(email: $email) { id } }`, { email: toEmail });
+    if (!data?.memberByEmail) return { action: "close", reason: "sender isn't a Memberful member (likely vendor or spam)", threadId, to: toEmail };
+  }
+
   let firstName = "";
   if (thread.associatedContactId) {
     try {
@@ -870,6 +877,9 @@ async function planTicket(ticket) {
       firstName = (c.properties?.firstname || "").trim().split(/\s+/)[0] || "";
     } catch {}
   }
+  // Drop names that aren't really names ("Home", "Info", "user123")
+  if (/\d/.test(firstName) || /^(home|info|admin|support|hello|contact|user|test|me|my|the|mr|mrs|ms)$/i.test(firstName) || firstName.length < 2) firstName = "";
+  else firstName = firstName.charAt(0).toUpperCase() + firstName.slice(1);
   const subj = lastIncoming.subject || ticket.properties?.subject || "Your support request";
   return {
     action: "email",
@@ -908,7 +918,7 @@ async function runBacklogAll() {
       try {
         const r = await processTicket(t);
         if (r.action === "email") backlogRun.emailed++;
-        else if (r.action === "close") backlogRun.closedOnly++;
+        else if (r.action === "close") { backlogRun.closedOnly++; if (r.reason?.startsWith("sender isn't")) backlogRun.notMembers = (backlogRun.notMembers || 0) + 1; }
         else backlogRun.skipped++;
       } catch (e) {
         backlogRun.failed++;
