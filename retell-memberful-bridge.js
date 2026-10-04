@@ -61,19 +61,65 @@ async function memberful(query, variables) {
 }
 
 // Confirm field names in Memberful's API Explorer before going live
+const SUB_FIELDS = "active autorenew pastDue createdAt activatedAt expiresAt trialStartAt trialEndAt plan { name priceCents intervalUnit intervalCount }";
+
 const LOOKUP = `
   query ($email: String!) {
     memberByEmail(email: $email) {
       id
       fullName
-      subscriptions {
-        active
-        expiresAt
-        createdAt
-        plan { name }
-      }
+      subscriptions { ${SUB_FIELDS} }
     }
   }`;
+
+// ---- Subscription details, shared by Riya's lookup, name search and cleanup notes ----
+function usd(cents) {
+  if (cents == null) return null;
+  return "$" + (cents / 100).toLocaleString("en-US", { minimumFractionDigits: cents % 100 ? 2 : 0, maximumFractionDigits: 2 });
+}
+function planPrice(plan) {
+  if (!plan || plan.priceCents == null) return null;
+  if (plan.priceCents === 0) return "free";
+  const unit = (plan.intervalUnit || "").toLowerCase();
+  const n = plan.intervalCount || 1;
+  if (!unit) return usd(plan.priceCents);
+  return n === 1 ? `${usd(plan.priceCents)}/${unit}` : `${usd(plan.priceCents)} every ${n} ${unit}s`;
+}
+function longDate(t) {
+  return t
+    ? new Date(t * 1000).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "America/Puerto_Rico" })
+    : null;
+}
+// Plain-English status for one subscription
+function subDetails(s) {
+  const now = Date.now() / 1000;
+  const onTrial = s.active && s.trialEndAt && s.trialEndAt > now;
+  let status;
+  if (!s.active) status = s.expiresAt ? `ended ${longDate(s.expiresAt)}` : "ended";
+  else if (s.pastDue) status = `ACTIVE but PAST DUE (payment failed)${s.expiresAt ? `, access through ${longDate(s.expiresAt)}` : ""}`;
+  else if (onTrial) status = s.autorenew ? `FREE TRIAL, converts to paid on ${longDate(s.trialEndAt)}` : `FREE TRIAL, canceled, access ends ${longDate(s.trialEndAt)}`;
+  else if (!s.autorenew) status = `ACTIVE, canceled (won't renew), access ends ${longDate(s.expiresAt)}`;
+  else status = s.expiresAt ? `ACTIVE, renews ${longDate(s.expiresAt)}` : "ACTIVE, no end date";
+  return {
+    plan: s.plan?.name || "unknown plan",
+    price: planPrice(s.plan),
+    active: !!s.active,
+    status,
+    auto_renew: !!s.autorenew,
+    past_due: !!s.pastDue,
+    on_trial: !!onTrial,
+    trial_ends_on: onTrial ? longDate(s.trialEndAt) : null,
+    started_on: longDate(s.createdAt),
+    renews_or_ends_on: longDate(onTrial ? s.trialEndAt : s.expiresAt),
+  };
+}
+function subLine(s) {
+  const d = subDetails(s);
+  return `${d.plan}${d.price ? ` (${d.price})` : ""}: ${d.status}; started ${d.started_on || "?"}`;
+}
+function sortSubs(subs) {
+  return [...(subs || [])].sort((a, b) => (b.active - a.active) || ((b.createdAt || 0) - (a.createdAt || 0)));
+}
 
 // Retell custom function: lookup_member  (args: { email })
 app.post("/lookup-member", verifyRetell, async (req, res) => {
@@ -90,42 +136,20 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
       });
     }
 
-    const subs = m.subscriptions || [];
+    const subs = sortSubs(m.subscriptions);
     const active = subs.filter((s) => s.active);
 
-    // Memberful returns Unix timestamps in seconds; turn them into spoken dates
-    const day = (t) =>
-      t
-        ? new Date(t * 1000).toLocaleDateString("en-US", {
-            month: "long",
-            day: "numeric",
-            year: "numeric",
-            timeZone: "America/New_York",
-          })
-        : null;
-
-    // Most recent subscription, so Riya can explain an ended trial or plan
-    const latest = [...subs].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
-
-    // Only return what the agent needs to say out loud. No billing details.
+    // Only what the agent needs to say out loud. Plan prices are public; no card details.
     res.json({
       result: {
         found: true,
         name: m.fullName,
         has_active_plan: active.length > 0,
-        active_plans: active.map((s) => ({
-          plan: s.plan?.name,
-          renews_or_ends_on: day(s.expiresAt),
-        })),
         active_subscription_count: active.length, // >1 can explain double billing
-        most_recent_plan: latest
-          ? {
-              plan: latest.plan?.name,
-              active: latest.active,
-              started_on: day(latest.createdAt),
-              ends_or_ended_on: day(latest.expiresAt),
-            }
-          : null,
+        active_plans: active.map(subDetails),
+        any_past_due: active.some((s) => s.pastDue),
+        // Last few ended plans, so Riya can explain an expired trial or lapsed plan
+        past_plans: subs.filter((s) => !s.active).slice(0, 3).map(subDetails),
       },
     });
   } catch (e) {
@@ -319,12 +343,13 @@ async function runCleanup(ticketId, mode) {
       const active = (m.subscriptions || []).filter((s) => s.active);
       if (active.length) {
         lines.push(
-          `${email}: SKIPPED, has an active subscription (${active.map((s) => s.plan?.name).join(", ")}). Handle this one by hand.`
+          `${email}: SKIPPED, has an active subscription (${active.map(subLine).join("; ")}). Handle this one by hand.`
         );
         continue;
       }
       if (mode !== "delete") {
-        lines.push(`${email}: would DELETE member #${m.id} (${m.fullName || "no name"}), no active subscriptions.`);
+        const hist = sortSubs(m.subscriptions).slice(0, 3).map(subLine).join("; ") || "no subscriptions";
+        lines.push(`${email}: would DELETE member #${m.id} (${m.fullName || "no name"}), no active subscriptions. History: ${hist}.`);
         continue;
       }
       const del = await memberful(DELETE_MEMBER, { id: m.id });
@@ -370,7 +395,7 @@ const MEMBERS_PAGE = `
   query ($after: String) {
     members(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
-      edges { node { id fullName email subscriptions { active createdAt expiresAt plan { name } } } }
+      edges { node { id fullName email subscriptions { ${SUB_FIELDS} } } }
     }
   }`;
 
@@ -481,14 +506,16 @@ async function runNameSearch(ticketId) {
         const d = describeMember(m);
         const email = (m.email || "").toLowerCase();
         const tag = email === activeEmail ? " <b>(this ticket's contact, protected)</b>" : "";
-        return `${m.fullName || "no name"} | ${email || "no email"} | ${d.status} | joined ${d.joined}${tag}`;
+        const subs = sortSubs(m.subscriptions);
+        const subText = subs.length ? subs.map((x) => `&nbsp;&nbsp;• ${subLine(x)}`).join("<br>") : "&nbsp;&nbsp;• no subscriptions";
+        return `<b>${m.fullName || "no name"}</b> | ${email || "no email"} | joined ${d.joined}${tag}<br>${subText}`;
       });
       const candidates = shown
         .filter((m) => !describeMember(m).active && (m.email || "").toLowerCase() !== activeEmail)
         .map((m) => m.email.toLowerCase());
       body =
         `Found ${hits.length} account(s) matching "${query}"${hits.length > 25 ? " (showing the first 25)" : ""}:<br><br>` +
-        rows.join("<br>") +
+        rows.join("<br><br>") +
         "<br><br><b>Inactive matches you could clean up:</b><br>" +
         (candidates.length ? candidates.join(", ") : "none") +
         "<br><br>Same name doesn't always mean same person. Confirm each one is really this member " +
