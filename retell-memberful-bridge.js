@@ -4,6 +4,8 @@
 //    accounts, plus "Find by name" to locate a member's other accounts
 //    accounts, triggered from a HubSpot ticket property (Riya can't reach it)
 //  - /send-link-text: Riya texts the caller a fixed link via a Zapier -> SlickText Zap
+//  - One-time backlog cleanup: reply in each stuck AI-handoff ticket's email
+//    thread, then close it (POST /admin/backlog-reply)
 //  - Daily dispute alert (9 AM Puerto Rico): posts Stripe disputes that need a
 //    response soon as a phone/computer push notification and/or email
 //  - Trial sync (hourly): copies Memberful trial end dates to HubSpot contacts
@@ -772,6 +774,198 @@ app.post("/admin/dispute-alert", async (req, res) => {
     return res.status(401).json({ error: "unauthorized" });
   }
   try { res.json(await sendDisputeAlert()); } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---------------------------------------------------------------------------
+// One-time backlog cleanup for tickets stuck with "HD Support AI"
+// For each open ticket the Customer Agent escalated (owner = HD Support AI,
+// created before a cutoff): reply in the original email thread from a human
+// teammate, then close the ticket. If a human already replied last, it just
+// closes the ticket without emailing. Tickets with no email thread are skipped
+// and left open.
+//
+//   POST /admin/backlog-reply   header x-admin-token
+//   {"mode":"dry"}                          -> count + preview of the first 5
+//   {"mode":"one","ticketId":"123"}         -> email + close just that ticket
+//   {"mode":"all"}                          -> run all (in the background)
+//   GET  /admin/backlog-reply/status        -> progress
+// Needs the private app scopes conversations.read + conversations.write + tickets.
+// ---------------------------------------------------------------------------
+
+const BACKLOG = {
+  aiOwnerId: process.env.BACKLOG_AI_OWNER_ID || "86933385",       // HD Support AI
+  senderOwnerId: process.env.BACKLOG_SENDER_OWNER_ID || "86840305", // Asia Varner (shows as sender)
+  cutoff: process.env.BACKLOG_CUTOFF || "2026-09-20T00:00:00Z",
+  closedStage: process.env.BACKLOG_CLOSED_STAGE || "4",
+};
+const backlogRun = { running: false, total: 0, done: 0, emailed: 0, closedOnly: 0, skipped: 0, failed: 0, errors: [], startedAt: null, finishedAt: null };
+
+function backlogText(firstName) {
+  const hi = firstName ? `Hi ${firstName},` : "Hi there,";
+  const text =
+    `${hi}\n\nWe're so sorry we didn't get back to you on this. If you still need help, just reply to this email ` +
+    `and a member of our team will jump in. If it's already sorted, no action needed.\n\n— Honey Drip Network Support`;
+  const rich = text.split("\n\n").map((p) => `<p>${p.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</p>`).join("");
+  return { text, rich };
+}
+
+async function findBacklogTickets(limitAll = true) {
+  const out = [];
+  let after;
+  do {
+    const body = {
+      filterGroups: [{ filters: [
+        { propertyName: "createdate", operator: "LT", value: BACKLOG.cutoff },
+        { propertyName: "hs_customer_agent_ticket_status", operator: "EQ", value: "ESCALATED" },
+        { propertyName: "hubspot_owner_id", operator: "EQ", value: BACKLOG.aiOwnerId },
+        { propertyName: "hs_pipeline_stage", operator: "NEQ", value: BACKLOG.closedStage },
+      ] }],
+      sorts: [{ propertyName: "createdate", direction: "ASCENDING" }],
+      properties: ["subject", "hs_conversations_originating_thread_id"],
+      limit: 100,
+      ...(after ? { after } : {}),
+    };
+    const r = await hubspot("POST", "/crm/v3/objects/tickets/search", body);
+    out.push(...(r.results || []));
+    after = r.paging?.next?.after;
+    if (!limitAll) break;
+    await new Promise((res) => setTimeout(res, 300));
+  } while (after);
+  return out;
+}
+
+let senderUserIdCache = null;
+async function senderActorId() {
+  if (!senderUserIdCache) {
+    const o = await hubspot("GET", `/crm/v3/owners/${BACKLOG.senderOwnerId}`);
+    if (!o.userId) throw new Error("Sender owner has no HubSpot user id");
+    senderUserIdCache = `A-${o.userId}`;
+  }
+  return senderUserIdCache;
+}
+
+// Work out what to send for one ticket, without sending anything
+async function planTicket(ticket) {
+  const threadId = ticket.properties?.hs_conversations_originating_thread_id;
+  if (!threadId) return { action: "skip", reason: "no email thread" };
+  const thread = await hubspot("GET", `/conversations/v3/conversations/threads/${threadId}`);
+  const msgs = (await hubspot("GET", `/conversations/v3/conversations/threads/${threadId}/messages?limit=100`)).results || [];
+  const real = msgs.filter((m) => m.type === "MESSAGE").sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  if (!real.length) return { action: "skip", reason: "no messages in thread" };
+  const last = real[real.length - 1];
+  const lastIncoming = [...real].reverse().find((m) => m.direction === "INCOMING");
+  if (!lastIncoming) return { action: "skip", reason: "no message from the member" };
+
+  // A human teammate already answered last -> just close it
+  const humanAnsweredLast = last.direction === "OUTGOING" && (last.senders || []).some((x) => String(x.actorId || "").startsWith("A-"));
+  if (humanAnsweredLast) return { action: "close", reason: "a teammate already replied", threadId };
+
+  const from = (lastIncoming.senders || []).find((x) => x.deliveryIdentifier?.value);
+  if (!from) return { action: "skip", reason: "no sender email on the thread" };
+
+  let firstName = "";
+  if (thread.associatedContactId) {
+    try {
+      const c = await hubspot("GET", `/crm/v3/objects/contacts/${thread.associatedContactId}?properties=firstname`);
+      firstName = (c.properties?.firstname || "").trim().split(/\s+/)[0] || "";
+    } catch {}
+  }
+  const subj = lastIncoming.subject || ticket.properties?.subject || "Your support request";
+  return {
+    action: "email",
+    threadId,
+    to: from.deliveryIdentifier.value,
+    firstName,
+    payload: {
+      type: "MESSAGE",
+      channelId: lastIncoming.channelId,
+      channelAccountId: lastIncoming.channelAccountId,
+      subject: /^re:/i.test(subj) ? subj : `Re: ${subj}`,
+      recipients: [{ actorId: from.actorId, deliveryIdentifier: from.deliveryIdentifier, recipientField: "TO" }],
+    },
+  };
+}
+
+async function processTicket(ticket) {
+  const plan = await planTicket(ticket);
+  if (plan.action === "skip") return plan;
+  if (plan.action === "email") {
+    const { text, rich } = backlogText(plan.firstName);
+    await hubspot("POST", `/conversations/v3/conversations/threads/${plan.threadId}/messages`, {
+      ...plan.payload, text, richText: rich, senderActorId: await senderActorId(),
+    });
+  }
+  await hubspot("PATCH", `/crm/v3/objects/tickets/${ticket.id}`, { properties: { hs_pipeline_stage: BACKLOG.closedStage } });
+  return plan;
+}
+
+async function runBacklogAll() {
+  Object.assign(backlogRun, { running: true, total: 0, done: 0, emailed: 0, closedOnly: 0, skipped: 0, failed: 0, errors: [], startedAt: new Date().toISOString(), finishedAt: null });
+  try {
+    const tickets = await findBacklogTickets(true);
+    backlogRun.total = tickets.length;
+    for (const t of tickets) {
+      try {
+        const r = await processTicket(t);
+        if (r.action === "email") backlogRun.emailed++;
+        else if (r.action === "close") backlogRun.closedOnly++;
+        else backlogRun.skipped++;
+      } catch (e) {
+        backlogRun.failed++;
+        if (backlogRun.errors.length < 20) backlogRun.errors.push(`${t.id}: ${String(e.message || e).slice(0, 200)}`);
+      }
+      backlogRun.done++;
+      await new Promise((res) => setTimeout(res, 1200)); // stay well under HubSpot rate limits
+    }
+  } catch (e) {
+    backlogRun.errors.push(`search: ${String(e.message || e).slice(0, 200)}`);
+  } finally {
+    backlogRun.running = false;
+    backlogRun.finishedAt = new Date().toISOString();
+    console.log("Backlog reply finished:", JSON.stringify(backlogRun));
+  }
+}
+
+function adminOk(req) {
+  return process.env.ADMIN_TOKEN && req.headers["x-admin-token"] === process.env.ADMIN_TOKEN;
+}
+
+app.post("/admin/backlog-reply", async (req, res) => {
+  if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
+  let body = {};
+  try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
+  req.body = body;
+  const mode = body.mode;
+  try {
+    if (mode === "dry") {
+      const tickets = await findBacklogTickets(true);
+      const preview = [];
+      for (const t of tickets.slice(0, 5)) {
+        const p = await planTicket(t).catch((e) => ({ action: "error", reason: String(e.message || e).slice(0, 200) }));
+        preview.push({ ticketId: t.id, action: p.action, reason: p.reason, to: p.to, firstName: p.firstName, subject: p.payload?.subject });
+      }
+      return res.json({ total: tickets.length, preview, message: backlogText("{first name}").text });
+    }
+    if (mode === "one") {
+      if (!req.body?.ticketId) return res.status(400).json({ error: "ticketId required" });
+      const t = await hubspot("GET", `/crm/v3/objects/tickets/${req.body.ticketId}?properties=subject,hs_conversations_originating_thread_id`);
+      const r = await processTicket(t);
+      return res.json({ ticketId: t.id, action: r.action, reason: r.reason, to: r.to });
+    }
+    if (mode === "all") {
+      if (backlogRun.running) return res.status(409).json({ error: "already running", ...backlogRun });
+      runBacklogAll();
+      return res.json({ started: true, check: "GET /admin/backlog-reply/status" });
+    }
+    res.status(400).json({ error: 'mode must be "dry", "one" or "all"' });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+app.get("/admin/backlog-reply/status", (req, res) => {
+  if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
+  res.json(backlogRun);
 });
 
 app.listen(process.env.PORT || 3000);
