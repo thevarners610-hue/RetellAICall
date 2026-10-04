@@ -68,6 +68,7 @@ const LOOKUP = `
     memberByEmail(email: $email) {
       id
       fullName
+      discordUserId
       subscriptions { ${SUB_FIELDS} }
     }
   }`;
@@ -121,6 +122,55 @@ function sortSubs(subs) {
   return [...(subs || [])].sort((a, b) => (b.active - a.active) || ((b.createdAt || 0) - (a.createdAt || 0)));
 }
 
+// ---- Discord: is the member's linked Discord account in the server, and with which roles ----
+// Uses a bot that's already in the HDN server (read-only). Env: DISCORD_BOT_TOKEN, DISCORD_GUILD_ID,
+// optional DISCORD_PAID_ROLE_IDS (comma-separated role IDs that paid members should have).
+let discordRoles = { at: 0, byId: new Map() };
+async function discordApi(path) {
+  const r = await fetch(`https://discord.com/api/v10${path}`, {
+    headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` },
+  });
+  if (r.status === 429) {
+    const wait = Number((await r.json().catch(() => ({}))).retry_after || 1);
+    await new Promise((res) => setTimeout(res, Math.min(wait, 5) * 1000));
+    return discordApi(path);
+  }
+  return { status: r.status, body: await r.json().catch(() => null) };
+}
+async function roleNames(ids) {
+  if (Date.now() - discordRoles.at > 60 * 60 * 1000) {
+    const { status, body } = await discordApi(`/guilds/${process.env.DISCORD_GUILD_ID}/roles`);
+    if (status === 200 && Array.isArray(body)) discordRoles = { at: Date.now(), byId: new Map(body.map((r) => [r.id, r.name])) };
+  }
+  return ids.map((id) => discordRoles.byId.get(id) || id);
+}
+async function discordStatus(discordUserId) {
+  if (!process.env.DISCORD_BOT_TOKEN || !process.env.DISCORD_GUILD_ID) return { checked: false };
+  if (!discordUserId) return { checked: true, linked: false, summary: "No Discord account linked in Memberful" };
+  try {
+    const { status, body } = await discordApi(`/guilds/${process.env.DISCORD_GUILD_ID}/members/${discordUserId}`);
+    if (status === 404) {
+      return { checked: true, linked: true, in_server: false, summary: "Discord linked, but NOT in the server" };
+    }
+    if (status !== 200) return { checked: false, error: `Discord ${status}` };
+    const roles = await roleNames(body.roles || []);
+    const paidIds = (process.env.DISCORD_PAID_ROLE_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
+    const hasPaid = paidIds.length ? (body.roles || []).some((r) => paidIds.includes(r)) : null;
+    const name = body.user?.global_name || body.user?.username || "";
+    let summary = `In the server as ${name || "unknown"}${body.user?.username ? ` (@${body.user.username})` : ""}; roles: ${roles.length ? roles.join(", ") : "none"}`;
+    if (hasPaid === false) summary += " (MISSING paid role)";
+    return {
+      checked: true, linked: true, in_server: true,
+      username: body.user?.username || null, display_name: name || null,
+      roles, has_paid_role: hasPaid,
+      joined_server_on: body.joined_at ? longDate(Math.floor(new Date(body.joined_at).getTime() / 1000)) : null,
+      summary,
+    };
+  } catch (e) {
+    return { checked: false, error: String(e.message || e) };
+  }
+}
+
 // Retell custom function: lookup_member  (args: { email })
 app.post("/lookup-member", verifyRetell, async (req, res) => {
   const email = (req.body?.args?.email || "").trim().toLowerCase();
@@ -150,6 +200,8 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
         any_past_due: active.some((s) => s.pastDue),
         // Last few ended plans, so Riya can explain an expired trial or lapsed plan
         past_plans: subs.filter((s) => !s.active).slice(0, 3).map(subDetails),
+        // Discord: linked? in the server? which roles?
+        discord: await discordStatus(m.discordUserId),
       },
     });
   } catch (e) {
@@ -165,15 +217,39 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
 // never from anything Riya says), fixed link types only, one text per call.
 // ---------------------------------------------------------------------------
 
-const LINK_TYPES = [
-  "account_sign_in",
-  "discord_reconnect",
-  "support_ticket",
-  "apparel_store",
-  "affiliate_signup",
-  "all_links",
-];
-const textedCalls = new Map(); // call_id -> time sent
+const MEMBERFUL_SIGN_IN = "https://aristotlesignals.memberful.com/auth/sign_in";
+const DISCORD_RECONNECT = "https://aristotlesignals.memberful.com/account/discord/authorize";
+const SUPPORT_FORM = "https://share.hsforms.com/2MgOAUJOaRI6W1PRppczVkwuaf69";
+const STOP = "Reply STOP to opt out.";
+
+// Message text for each link type (the Zap sends whatever "message" the bridge provides)
+const LINK_TEXTS = {
+  account_sign_in: `Honey Drip Network: Here's your account link to update your card, upgrade, or cancel: ${MEMBERFUL_SIGN_IN} ${STOP}`,
+  discord_reconnect: `Honey Drip Network: Tap to reconnect Discord to your plan (make sure you're logged into the right Discord first): ${DISCORD_RECONNECT} ${STOP}`,
+  support_ticket: `Honey Drip Network: Submit a support ticket here: ${SUPPORT_FORM} ${STOP}`,
+  apparel_store: `Honey Drip Apparel: Shop Drop 001 here: https://www.honeydripnetwork.com/category/all-products ${STOP}`,
+  affiliate_signup: `Honey Drip Network: Join the affiliate program (50% recurring commission): https://whop.com/checkout/14YkAEgaxs8lrBICDD-XgcQ-eRh2-Jvy9-Zdxdfy0T1m8v/ ${STOP}`,
+  all_links: `Honey Drip Network links. Account: ${MEMBERFUL_SIGN_IN} Discord: ${DISCORD_RECONNECT} Support: ${SUPPORT_FORM} ${STOP}`,
+};
+const LINK_TYPES = Object.keys(LINK_TEXTS);
+
+// Plans Riya can sell by phone (Memberful plan IDs, confirmed via the Memberful API)
+const CHECKOUT_PLANS = {
+  free_trial:          { id: "147065", name: "Options Trading 7-Day Free Trial", price: "free for 7 days, then $125/month (first-time members only)" },
+  options_monthly:     { id: "48773",  name: "Options Trading (Monthly)",        price: "$125/month" },
+  options_yearly:      { id: "56175",  name: "Options Trading (Yearly)",         price: "$1,100/year" },
+  live_trading_monthly:{ id: "81750",  name: "Options + Live Trading (Monthly)", price: "$200/month" },
+  live_trading_yearly: { id: "84062",  name: "Options + Live Trading (Yearly)",  price: "$2,000/year" },
+  all_access_monthly:  { id: "81709",  name: "All Access (Monthly)",             price: "$250/month" },
+  all_access_yearly:   { id: "89735",  name: "All Access (Yearly)",              price: "$2,600/year" },
+  real_estate_options: { id: "122687", name: "Real Estate + Options (Monthly)",  price: "$165/month" },
+  honey_drip_university:{ id: "91193", name: "Honey Drip University (Monthly)",  price: "$25/month" },
+};
+function checkoutUrl(planId) {
+  return `https://aristotlesignals.memberful.com/checkout?plan=${planId}&utm_source=phone&utm_medium=riya`;
+}
+
+const textedCalls = new Map(); // `${call_id}:${kind}` -> time sent
 
 function toTenDigit(e164) {
   const digits = (e164 || "").replace(/\D/g, "");
@@ -182,54 +258,57 @@ function toTenDigit(e164) {
   return "";
 }
 
-app.post("/send-link-text", verifyRetell, async (req, res) => {
+// Shared: text the caller (only the number that's calling), max one text of each kind per call
+async function textCaller(req, res, kind, linkType, message, okResult) {
   const call = req.body?.call || {};
-  const linkType = String(req.body?.args?.link_type || "").toLowerCase();
-
-  if (!LINK_TYPES.includes(linkType)) {
-    return res.json({ result: "Unknown link type. Offer to email the link instead." });
-  }
-
-  // Inbound calls: the caller is from_number. Web test calls have no number.
   const phone = call.direction === "outbound" ? call.to_number : call.from_number;
   const tenDigit = toTenDigit(phone);
   if (!tenDigit) {
-    return res.json({
-      result: "Can't text this caller (no US phone number on the call). Offer to email the link instead.",
-    });
+    return res.json({ result: "Can't text this caller (no US phone number on the call). Offer to email the link instead, or point them to honeydripnetwork.com." });
   }
-
   const callId = call.call_id || "";
-  if (callId && textedCalls.has(callId)) {
-    return res.json({
-      result: "A text was already sent on this call. Only one text per call. If they need more links, offer the All links email.",
-    });
+  const key = `${callId}:${kind}`;
+  if (callId && textedCalls.has(key)) {
+    return res.json({ result: `A ${kind === "checkout" ? "checkout link" : "link"} was already texted on this call. Don't send another; ask them to check their messages.` });
   }
-
   try {
     const r = await fetch(process.env.ZAPIER_SMS_HOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        token: process.env.ZAPIER_SMS_TOKEN,
-        link_type: linkType,
-        phone_e164: phone,
-        phone_10: tenDigit,
-        call_id: callId,
-      }),
+      body: JSON.stringify({ token: process.env.ZAPIER_SMS_TOKEN, link_type: linkType, message, phone_e164: phone, phone_10: tenDigit, call_id: callId }),
     });
     if (!r.ok) throw new Error(`Zapier hook ${r.status}`);
-    if (callId) textedCalls.set(callId, Date.now());
-
-    // Forget old calls so memory doesn't grow
+    if (callId) textedCalls.set(key, Date.now());
     const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
     for (const [id, t] of textedCalls) if (t < dayAgo) textedCalls.delete(id);
-
-    res.json({ result: "Text sent to the caller's phone. Tell them it should arrive in a moment." });
+    res.json({ result: okResult });
   } catch (e) {
-    console.error("send-link-text failed:", e);
-    res.json({ result: "The text didn't go through. Offer to email the link instead." });
+    console.error(`text (${kind}) failed:`, e);
+    res.json({ result: "The text didn't go through. Offer to email the link instead, or point them to honeydripnetwork.com." });
   }
+}
+
+// Retell custom function: send_link_text (args: { link_type })
+app.post("/send-link-text", verifyRetell, async (req, res) => {
+  const linkType = String(req.body?.args?.link_type || "").toLowerCase();
+  if (!LINK_TYPES.includes(linkType)) {
+    return res.json({ result: "Unknown link type. Offer to email the link instead." });
+  }
+  return textCaller(req, res, "link", linkType, LINK_TEXTS[linkType],
+    "Text sent to the caller's phone. Tell them it should arrive in a moment.");
+});
+
+// Retell custom function: send_checkout_link (args: { plan })
+// Riya never takes card details by phone; the caller pays on Memberful's secure checkout page.
+app.post("/send-checkout-link", verifyRetell, async (req, res) => {
+  const planKey = String(req.body?.args?.plan || "").toLowerCase();
+  const plan = CHECKOUT_PLANS[planKey];
+  if (!plan) return res.json({ result: "Unknown plan. Confirm which plan they want and try again." });
+  const message =
+    `Honey Drip Network: Here's your secure checkout link for ${plan.name} (${plan.price}): ${checkoutUrl(plan.id)} ` +
+    `Renews automatically, cancel anytime. ${STOP}`;
+  return textCaller(req, res, "checkout", `checkout_${planKey}`, message,
+    `Checkout link for ${plan.name} (${plan.price}) texted. Tell them it should arrive in a moment and they can complete checkout while you stay on the line. After they finish, ask for the email they used and call lookup_member to confirm the plan is active.`);
 });
 
 // ---------------------------------------------------------------------------
@@ -349,7 +428,8 @@ async function runCleanup(ticketId, mode) {
       }
       if (mode !== "delete") {
         const hist = sortSubs(m.subscriptions).slice(0, 3).map(subLine).join("; ") || "no subscriptions";
-        lines.push(`${email}: would DELETE member #${m.id} (${m.fullName || "no name"}), no active subscriptions. History: ${hist}.`);
+        const dc = await discordStatus(m.discordUserId);
+        lines.push(`${email}: would DELETE member #${m.id} (${m.fullName || "no name"}), no active subscriptions. History: ${hist}.${dc.summary ? ` Discord: ${dc.summary}.` : ""}`);
         continue;
       }
       const del = await memberful(DELETE_MEMBER, { id: m.id });
@@ -395,7 +475,7 @@ const MEMBERS_PAGE = `
   query ($after: String) {
     members(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
-      edges { node { id fullName email subscriptions { ${SUB_FIELDS} } } }
+      edges { node { id fullName email discordUserId subscriptions { ${SUB_FIELDS} } } }
     }
   }`;
 
@@ -502,13 +582,15 @@ async function runNameSearch(ticketId) {
       body = `No Memberful accounts found for "${query}". Try just the last name, or a different spelling.`;
     } else {
       const shown = hits.slice(0, 25);
-      const rows = shown.map((m) => {
+      const discordLines = await Promise.all(shown.map((m) => discordStatus(m.discordUserId)));
+      const rows = shown.map((m, i) => {
         const d = describeMember(m);
         const email = (m.email || "").toLowerCase();
         const tag = email === activeEmail ? " <b>(this ticket's contact, protected)</b>" : "";
         const subs = sortSubs(m.subscriptions);
         const subText = subs.length ? subs.map((x) => `&nbsp;&nbsp;• ${subLine(x)}`).join("<br>") : "&nbsp;&nbsp;• no subscriptions";
-        return `<b>${m.fullName || "no name"}</b> | ${email || "no email"} | joined ${d.joined}${tag}<br>${subText}`;
+        const dc = discordLines[i]?.summary ? `<br>&nbsp;&nbsp;• Discord: ${discordLines[i].summary}` : "";
+        return `<b>${m.fullName || "no name"}</b> | ${email || "no email"} | joined ${d.joined}${tag}<br>${subText}${dc}`;
       });
       const candidates = shown
         .filter((m) => !describeMember(m).active && (m.email || "").toLowerCase() !== activeEmail)
