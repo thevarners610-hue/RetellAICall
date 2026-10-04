@@ -235,15 +235,17 @@ const LINK_TYPES = Object.keys(LINK_TEXTS);
 
 // Plans Riya can sell by phone (Memberful plan IDs, confirmed via the Memberful API)
 const CHECKOUT_PLANS = {
-  free_trial:          { id: "147065", name: "Options Trading 7-Day Free Trial", price: "free for 7 days, then $125/month (first-time members only)" },
-  options_monthly:     { id: "48773",  name: "Options Trading (Monthly)",        price: "$125/month" },
-  options_yearly:      { id: "56175",  name: "Options Trading (Yearly)",         price: "$1,100/year" },
-  live_trading_monthly:{ id: "81750",  name: "Options + Live Trading (Monthly)", price: "$200/month" },
-  live_trading_yearly: { id: "84062",  name: "Options + Live Trading (Yearly)",  price: "$2,000/year" },
-  all_access_monthly:  { id: "81709",  name: "All Access (Monthly)",             price: "$250/month" },
-  all_access_yearly:   { id: "89735",  name: "All Access (Yearly)",              price: "$2,600/year" },
-  real_estate_options: { id: "122687", name: "Real Estate + Options (Monthly)",  price: "$165/month" },
-  honey_drip_university:{ id: "91193", name: "Honey Drip University (Monthly)",  price: "$25/month" },
+  // Riya recommends these
+  options_monthly:      { id: "48773",  name: "Options Trading (Monthly)",        price: "$125/month" },
+  live_trading_monthly: { id: "81750",  name: "Options + Live Trading (Monthly)", price: "$200/month" },
+  free_trial:           { id: "147065", name: "Options Trading 7-Day Free Trial", price: "free for 7 days, then $125/month (first-time members only)" },
+  // Only when the caller asks for one of these specifically
+  options_yearly:       { id: "56175",  name: "Options Trading (Yearly)",         price: "$1,100/year" },
+  live_trading_yearly:  { id: "84062",  name: "Options + Live Trading (Yearly)",  price: "$2,000/year" },
+  all_access_monthly:   { id: "81709",  name: "All Access (Monthly)",             price: "$250/month" },
+  all_access_yearly:    { id: "89735",  name: "All Access (Yearly)",              price: "$2,600/year" },
+  real_estate_options:  { id: "122687", name: "Real Estate + Options (Monthly)",  price: "$165/month" },
+  honey_drip_university:{ id: "91193",  name: "Honey Drip University (Monthly)",  price: "$25/month" },
 };
 function checkoutUrl(planId) {
   return `https://aristotlesignals.memberful.com/checkout?plan=${planId}&utm_source=phone&utm_medium=riya`;
