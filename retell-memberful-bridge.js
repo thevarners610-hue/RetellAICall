@@ -1,6 +1,7 @@
 // Retell -> Memberful bridge
 //  - /lookup-member: read-only lookup for Riya (Retell custom function)
 //  - /hubspot/duplicate-cleanup: team-only cleanup of duplicate Memberful
+//    accounts, plus "Find by name" to locate a member's other accounts
 //    accounts, triggered from a HubSpot ticket property (Riya can't reach it)
 //  - /send-link-text: Riya texts the caller a fixed link via a Zapier -> SlickText Zap
 //  - Daily dispute alert (9 AM Puerto Rico): posts Stripe disputes that need a
@@ -352,6 +353,152 @@ async function runCleanup(ticketId, mode) {
   });
 }
 
+
+// ---------------------------------------------------------------------------
+// Memberful name search (for finding duplicate accounts)
+// Memberful's API can only look members up by email, so the bridge keeps an
+// in-memory list of every member (id, name, email, subscriptions) and searches
+// it by name. New members are picked up every hour; a full rebuild runs nightly
+// so renamed or deleted accounts drop out. Read-only on Memberful.
+// ---------------------------------------------------------------------------
+
+const memberIndex = { byId: new Map(), cursor: null, ready: false, building: false, builtAt: 0 };
+
+const MEMBERS_PAGE = `
+  query ($after: String) {
+    members(first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      edges { node { id fullName email subscriptions { active createdAt expiresAt plan { name } } } }
+    }
+  }`;
+
+async function refreshMemberIndex({ full = false } = {}) {
+  if (memberIndex.building) return;
+  memberIndex.building = true;
+  const started = Date.now();
+  try {
+    const byId = full ? new Map() : memberIndex.byId;
+    let after = full ? null : memberIndex.cursor;
+    let pages = 0;
+    for (;;) {
+      const { data, errors } = await memberful(MEMBERS_PAGE, { after });
+      if (errors) throw new Error(`Memberful: ${errors[0]?.message}`);
+      const conn = data?.members;
+      for (const e of conn?.edges || []) byId.set(e.node.id, e.node);
+      pages++;
+      if (conn?.pageInfo?.endCursor) after = conn.pageInfo.endCursor;
+      if (!conn?.pageInfo?.hasNextPage) break;
+      await new Promise((r) => setTimeout(r, 150)); // be gentle with Memberful
+    }
+    memberIndex.byId = byId;
+    memberIndex.cursor = after;
+    memberIndex.ready = true;
+    memberIndex.builtAt = Date.now();
+    console.log(`Member index ${full ? "rebuilt" : "updated"}: ${byId.size} members, ${pages} pages, ${Math.round((Date.now() - started) / 1000)}s`);
+  } catch (e) {
+    console.error("Member index refresh failed:", e);
+  } finally {
+    memberIndex.building = false;
+  }
+}
+
+// Build at startup, pick up new members hourly, full rebuild every 24 hours
+setTimeout(() => refreshMemberIndex({ full: true }), 30 * 1000);
+setInterval(() => refreshMemberIndex(), 60 * 60 * 1000);
+setInterval(() => refreshMemberIndex({ full: true }), 24 * 60 * 60 * 1000);
+
+function normName(s) {
+  return (s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Every word of the search must match a word of the member's name (or the start
+// of one, for 3+ letters), in any order. Also matches emails like "johnsmith88@".
+function searchMembersByName(query) {
+  const q = normName(query).split(" ").filter(Boolean);
+  if (!q.length) return [];
+  const joined = q.join("");
+  const out = [];
+  for (const m of memberIndex.byId.values()) {
+    const words = normName(m.fullName).split(" ").filter(Boolean);
+    const nameHit = q.every((t) => words.some((w) => w === t || (t.length >= 3 && w.startsWith(t))));
+    const local = (m.email || "").toLowerCase().split("@")[0].replace(/[^a-z0-9]/g, "");
+    const emailHit = q.length >= 2 && joined.length >= 6 && local.includes(joined);
+    if (nameHit || emailHit) out.push(m);
+  }
+  return out;
+}
+
+function fmtDate(unixSeconds) {
+  return unixSeconds ? new Date(unixSeconds * 1000).toISOString().slice(0, 10) : "?";
+}
+
+function describeMember(m) {
+  const subs = m.subscriptions || [];
+  const active = subs.filter((s) => s.active);
+  const first = subs.reduce((min, s) => (s.createdAt && (!min || s.createdAt < min) ? s.createdAt : min), 0);
+  const lastEnd = subs.reduce((max, s) => (s.expiresAt && s.expiresAt > max ? s.expiresAt : max), 0);
+  const status = active.length
+    ? `ACTIVE: ${active.map((s) => s.plan?.name).join(", ")}`
+    : subs.length
+    ? `inactive (last access ended ${fmtDate(lastEnd)})`
+    : "no subscriptions";
+  return { status, joined: first ? fmtDate(first) : "?", active: active.length > 0 };
+}
+
+async function runNameSearch(ticketId) {
+  const ticket = await hubspot(
+    "GET",
+    `/crm/v3/objects/tickets/${ticketId}?properties=memberful_name_search&associations=contacts`
+  );
+  const contactId = ticket.associations?.contacts?.results?.[0]?.id || null;
+  let activeEmail = "";
+  let contactName = "";
+  if (contactId) {
+    const c = await hubspot("GET", `/crm/v3/objects/contacts/${contactId}?properties=email,firstname,lastname`);
+    activeEmail = (c.properties?.email || "").trim().toLowerCase();
+    contactName = `${c.properties?.firstname || ""} ${c.properties?.lastname || ""}`.trim();
+  }
+  const query = (ticket.properties?.memberful_name_search || "").trim() || contactName;
+
+  let body;
+  if (!query) {
+    body = "No name to search. Fill in <b>Memberful name search</b> (or the contact's first and last name) and try again.";
+  } else if (!memberIndex.ready) {
+    refreshMemberIndex({ full: true });
+    body = "The member list is still loading (this takes a few minutes after the bridge restarts). Try again in about 5 minutes.";
+  } else {
+    if (Date.now() - memberIndex.builtAt > 10 * 60 * 1000) await refreshMemberIndex(); // grab brand-new signups
+    const hits = searchMembersByName(query);
+    if (!hits.length) {
+      body = `No Memberful accounts found for "${query}". Try just the last name, or a different spelling.`;
+    } else {
+      const shown = hits.slice(0, 25);
+      const rows = shown.map((m) => {
+        const d = describeMember(m);
+        const email = (m.email || "").toLowerCase();
+        const tag = email === activeEmail ? " <b>(this ticket's contact, protected)</b>" : "";
+        return `${m.fullName || "no name"} | ${email || "no email"} | ${d.status} | joined ${d.joined}${tag}`;
+      });
+      const candidates = shown
+        .filter((m) => !describeMember(m).active && (m.email || "").toLowerCase() !== activeEmail)
+        .map((m) => m.email.toLowerCase());
+      body =
+        `Found ${hits.length} account(s) matching "${query}"${hits.length > 25 ? " (showing the first 25)" : ""}:<br><br>` +
+        rows.join("<br>") +
+        "<br><br><b>Inactive matches you could clean up:</b><br>" +
+        (candidates.length ? candidates.join(", ") : "none") +
+        "<br><br>Same name doesn't always mean same person. Confirm each one is really this member " +
+        "(same phone, same Discord, or they told you), paste only those emails into <b>Old Memberful emails</b>, " +
+        "then set Duplicate cleanup to <b>Preview</b>.";
+    }
+  }
+
+  await addNote(ticketId, contactId, `<b>Memberful name search</b><br>${body}`);
+  await hubspot("PATCH", `/crm/v3/objects/tickets/${ticketId}`, { properties: { duplicate_cleanup: "" } });
+}
+
 // HubSpot private app webhook: ticket.propertyChange on duplicate_cleanup
 app.post("/hubspot/duplicate-cleanup", (req, res) => {
   if (!verifyHubSpot(req)) return res.status(401).json({ error: "unauthorized" });
@@ -369,6 +516,10 @@ app.post("/hubspot/duplicate-cleanup", (req, res) => {
   for (const e of Array.isArray(events) ? events : []) {
     const mode = (e.propertyValue || "").toLowerCase();
     if (e.propertyName !== "duplicate_cleanup") continue;
+    if (mode === "find by name") {
+      runNameSearch(String(e.objectId)).catch((err) => console.error("Name search failed:", err));
+      continue;
+    }
     if (mode !== "preview" && mode !== "delete") continue; // ignores our own reset
     runCleanup(String(e.objectId), mode).catch((err) =>
       console.error("Duplicate cleanup failed:", err)
@@ -569,6 +720,26 @@ async function sendDisputeAlert() {
       body: short,
     });
     results.push = r.status;
+  }
+
+  // Batch-drafting reminder: disputes due within 5 days that still have no draft
+  const needDraft = open.filter(
+    (d) => d.evidence_details.due_by - now <= 5 * 86400 && !d.evidence_details?.has_evidence
+  );
+  if (push && needDraft.length) {
+    const r = await fetch(`https://ntfy.sh/${encodeURIComponent(push)}`, {
+      method: "POST",
+      headers: {
+        Title: `Open Claude: ${needDraft.length} dispute${needDraft.length > 1 ? "s" : ""} need drafts`,
+        Priority: "high",
+        Tags: "memo",
+        Click: "https://claude.ai/new",
+      },
+      body:
+        `Say "draft the next batch of disputes" in a new chat.\n` +
+        needDraft.slice(0, 8).map((d) => `${d.evidence?.customer_name || "Unknown"}, due ${prLabel(d.evidence_details.due_by)}`).join("\n"),
+    });
+    results.draft_reminder = r.status;
   }
 
   // Email (Zapier Catch Hook -> Gmail "Send Email")
