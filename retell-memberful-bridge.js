@@ -589,6 +589,11 @@ function billingFacts(m) {
     hdn_access_ends: (onTrial ? sub.trialEndAt : sub.expiresAt) ? String(prDateMs(onTrial ? sub.trialEndAt : sub.expiresAt)) : "",
     hdn_member_since: firstSub ? String(prDateMs(firstSub)) : "",
     hdn_discord_user_id: m.discordUserId ? String(m.discordUserId) : "",
+    // Keep the older Memberful properties current too, since existing lists and
+    // marketing-status workflows still use them (the old Zaps that wrote them are off)
+    memberful_member_status: { active: "Active", trial: "Trial Active", past_due: "Past Due", canceled_with_access: "Cancelled", ended: "Cancelled" }[status],
+    memberful_plan_name: sub.plan?.name || "",
+    memberful_subscription_expires: sub.expiresAt ? String(prDateMs(sub.expiresAt)) : "",
   };
 }
 
@@ -628,7 +633,7 @@ async function syncBillingToHubSpot() {
     const batch = changed.slice(i, i + 100);
     try {
       await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", {
-        inputs: batch.map((c) => ({ idProperty: "email", id: c.email, properties: { email: c.email, ...c.facts } })),
+        inputs: batch.map((c) => ({ idProperty: "email", id: c.email, properties: { email: c.email, ...c.facts, memberful_last_updated: today } })),
       });
       for (const c of batch) billingState.lastSent.set(c.email, c.key);
       written += batch.length;
