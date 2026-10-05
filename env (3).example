@@ -1,0 +1,28 @@
+# Copy these into Railway > Variables (never commit real values)
+RETELL_API_KEY=your_retell_key_with_webhook_badge
+MEMBERFUL_API_KEY=your_memberful_custom_app_key
+
+# HubSpot private app for duplicate cleanup (separate from Retell's)
+HUBSPOT_TOKEN=your_private_app_access_token
+HUBSPOT_CLIENT_SECRET=your_private_app_client_secret
+
+# Optional: override if Memberful's delete mutation has a different name/shape
+# MEMBERFUL_DELETE_MUTATION is no longer needed (memberDelete confirmed)
+
+# Riya link texts via Zapier -> SlickText
+ZAPIER_SMS_HOOK_URL=your_zapier_catch_hook_url
+ZAPIER_SMS_TOKEN=make_up_a_long_random_string
+
+# Optional: lets you trigger the Memberful -> HubSpot trial sync on demand
+ADMIN_TOKEN=make_up_a_long_random_string
+
+# Daily dispute alert (9 AM Puerto Rico) to your phone/computer and/or email
+STRIPE_DISPUTES_KEY=rk_live_restricted_key_with_disputes_read_only
+ALERT_NTFY_TOPIC=hdn-disputes-make-this-long-and-random
+ALERT_EMAIL_HOOK=https://hooks.zapier.com/hooks/catch/...
+
+# Discord status in lookups (use a bot already in the HDN server, e.g. HD Mod or Riya)
+DISCORD_BOT_TOKEN=your_bot_token
+DISCORD_GUILD_ID=your_server_id
+# Optional: role IDs paid members should have, comma-separated
+DISCORD_PAID_ROLE_IDS=
