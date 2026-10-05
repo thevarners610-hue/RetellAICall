@@ -144,7 +144,23 @@ async function roleNames(ids) {
   }
   return ids.map((id) => discordRoles.byId.get(id) || id);
 }
-async function discordStatus(discordUserId) {
+// Which Discord role(s) each Memberful plan should give (matched by role NAME, so role IDs don't matter)
+function expectedRolesForPlan(planName) {
+  const n = (planName || "").toLowerCase();
+  const yearly = /year|\(y\)/.test(n);
+  const trial = /trial/.test(n);
+  if (/mentee|mentorship/.test(n)) return /all access/.test(n) ? ["Mentee + All Access (Y)"] : ["Mentee + Live (Y)"];
+  if (/all access/.test(n)) return yearly ? ["All Access (Y)", "All Access"] : ["All Access"];
+  if (/real estate/.test(n)) return ["Real Estate + Options"];
+  if (/university/.test(n)) return ["Honey Drip University"];
+  if (/sports/.test(n)) return /option/.test(n) ? ["Sports + Options"] : ["Sports Bettors", "Sports (T)"];
+  if (/live trading/.test(n)) return yearly ? ["Live Trading (Y)"] : trial ? ["Live Trading (T)"] : ["Live Trading"];
+  if (/free trial/.test(n)) return ["Free Trial"];
+  if (/option/.test(n)) return yearly ? ["Options (Y)"] : trial ? ["Options (T)"] : ["PREMIUM_MEMBERS"];
+  return [];
+}
+
+async function discordStatus(discordUserId, activePlanNames = []) {
   if (!process.env.DISCORD_BOT_TOKEN || !process.env.DISCORD_GUILD_ID) return { checked: false };
   if (!discordUserId) return { checked: true, linked: false, summary: "No Discord account linked in Memberful" };
   try {
@@ -157,12 +173,22 @@ async function discordStatus(discordUserId) {
     const paidIds = (process.env.DISCORD_PAID_ROLE_IDS || "").split(",").map((x) => x.trim()).filter(Boolean);
     const hasPaid = paidIds.length ? (body.roles || []).some((r) => paidIds.includes(r)) : null;
     const name = body.user?.global_name || body.user?.username || "";
+    const lower = roles.map((r) => String(r).toLowerCase());
+    // For each active plan, does the member have the role that plan should give?
+    const planChecks = activePlanNames.map((plan) => {
+      const expected = expectedRolesForPlan(plan);
+      const ok = !expected.length || expected.some((e) => lower.includes(e.toLowerCase()));
+      return { plan, expected_role: expected.join(" or ") || null, has_role: ok };
+    });
+    const missing = planChecks.filter((c) => !c.has_role);
     let summary = `In the server as ${name || "unknown"}${body.user?.username ? ` (@${body.user.username})` : ""}; roles: ${roles.length ? roles.join(", ") : "none"}`;
-    if (hasPaid === false) summary += " (MISSING paid role)";
+    if (missing.length) summary += ` (MISSING role for their plan: ${missing.map((m) => `${m.plan} should have "${m.expected_role}"`).join("; ")})`;
+    else if (activePlanNames.length && planChecks.length) summary += " (roles match their plan)";
+    else if (hasPaid === false) summary += " (MISSING paid role)";
     return {
       checked: true, linked: true, in_server: true,
       username: body.user?.username || null, display_name: name || null,
-      roles, has_paid_role: hasPaid,
+      roles, has_paid_role: hasPaid, plan_role_checks: planChecks, roles_match_plan: !missing.length,
       joined_server_on: body.joined_at ? longDate(Math.floor(new Date(body.joined_at).getTime() / 1000)) : null,
       summary,
     };
@@ -201,7 +227,7 @@ app.post("/lookup-member", verifyRetell, async (req, res) => {
         // Last few ended plans, so Riya can explain an expired trial or lapsed plan
         past_plans: subs.filter((s) => !s.active).slice(0, 3).map(subDetails),
         // Discord: linked? in the server? which roles?
-        discord: await discordStatus(m.discordUserId),
+        discord: await discordStatus(m.discordUserId, active.map((x) => x.plan?.name)),
       },
     });
   } catch (e) {
@@ -584,7 +610,7 @@ async function runNameSearch(ticketId) {
       body = `No Memberful accounts found for "${query}". Try just the last name, or a different spelling.`;
     } else {
       const shown = hits.slice(0, 25);
-      const discordLines = await Promise.all(shown.map((m) => discordStatus(m.discordUserId)));
+      const discordLines = await Promise.all(shown.map((m) => discordStatus(m.discordUserId, (m.subscriptions || []).filter((x) => x.active).map((x) => x.plan?.name))));
       const rows = shown.map((m, i) => {
         const d = describeMember(m);
         const email = (m.email || "").toLowerCase();
