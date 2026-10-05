@@ -543,6 +543,7 @@ async function refreshMemberIndex({ full = false } = {}) {
 async function refreshAndSyncBilling() {
   await refreshMemberIndex({ full: true });
   if (memberIndex.ready) await syncBillingToHubSpot().catch((e) => console.error("Billing sync failed:", e));
+  if (memberIndex.ready) await refreshOpenTicketSummaries().catch((e) => console.error("Ticket summaries failed:", e));
 }
 setTimeout(refreshAndSyncBilling, 30 * 1000);
 setInterval(refreshAndSyncBilling, 60 * 60 * 1000);
@@ -743,6 +744,116 @@ async function runNameSearch(ticketId) {
   await hubspot("PATCH", `/crm/v3/objects/tickets/${ticketId}`, { properties: { duplicate_cleanup: "" } });
 }
 
+
+// ---------------------------------------------------------------------------
+// Billing summary on tickets (for HubSpot's AI agent)
+// HubSpot's agent actions can't read contact properties, but they can search
+// tickets. So when a ticket is created (and hourly while it's open), the bridge
+// writes the member's email and a plain-English billing summary onto the ticket.
+// ---------------------------------------------------------------------------
+
+const MEMBER_BY_EMAIL = `
+  query ($email: String!) {
+    memberByEmail(email: $email) {
+      id fullName email discordUserId
+      orders { createdAt totalCents status }
+      subscriptions { ${SUB_FIELDS} }
+    }
+  }`;
+
+async function findMemberForBilling(email) {
+  const e = (email || "").trim().toLowerCase();
+  if (!e) return null;
+  if (memberIndex.ready) {
+    for (const m of memberIndex.byId.values()) if ((m.email || "").toLowerCase() === e) return m;
+  }
+  const { data } = await memberful(MEMBER_BY_EMAIL, { email: e });
+  return data?.memberByEmail || null;
+}
+
+const STATUS_TEXT = {
+  active: "Active",
+  trial: "Free trial",
+  past_due: "Active but PAST DUE (last payment failed)",
+  canceled_with_access: "Canceled (auto-renew off), still has access",
+  ended: "Ended",
+};
+
+function billingSummaryText(m) {
+  const f = billingFacts(m);
+  if (!f) return `Member: ${m.fullName || ""} (${m.email}). No subscriptions on file.`;
+  const day = (ms) => (ms ? new Date(Number(ms)).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }) : null);
+  const off = billingState.offDate.get(m.id);
+  const ends = day(f.hdn_access_ends);
+  const lines = [
+    `Member: ${m.fullName || "(no name)"} (${m.email})${f.hdn_member_since ? `, member since ${day(f.hdn_member_since)}` : ""}`,
+    `Plan: ${f.hdn_plan}`,
+    `Status: ${STATUS_TEXT[f.hdn_membership_status]}${ends ? (f.hdn_membership_status === "ended" ? `, access ended ${ends}` : f.hdn_auto_renew === "true" ? `, next renewal ${ends}` : `, access until ${ends}`) : ""}`,
+    `Auto-renew: ${f.hdn_auto_renew === "true" ? "ON (will be charged on the renewal date)" : "OFF (will not be charged again)"}`,
+    `Last payment: ${f.hdn_last_payment_amount ? `$${Number(f.hdn_last_payment_amount).toFixed(2)} on ${day(f.hdn_last_payment_date)}` : "none on record"}`,
+    `Auto-renew turned off on: ${off ? day(off) : f.hdn_auto_renew === "true" ? "n/a (still on)" : "not recorded (canceled before Oct 2026 tracking began)"}`,
+    `Discord: ${m.discordUserId ? "connected in Memberful" : "NOT connected in Memberful"}`,
+    `Rule: Memberful never charges a renewal on a canceled subscription, so any payment that went through was made while auto-renew was ON.`,
+    `Updated: ${day(prDateMs(Math.floor(Date.now() / 1000)))}`,
+  ];
+  return lines.join("\n");
+}
+
+async function summarizeTicket(ticketId) {
+  const t = await hubspot("GET", `/crm/v3/objects/tickets/${ticketId}?properties=hs_pipeline_stage&associations=contacts`);
+  const contactId = t.associations?.contacts?.results?.[0]?.id;
+  if (!contactId) return { ticketId, skipped: "no contact" };
+  const c = await hubspot("GET", `/crm/v3/objects/contacts/${contactId}?properties=email`);
+  const email = (c.properties?.email || "").trim().toLowerCase();
+  if (!email) return { ticketId, skipped: "contact has no email" };
+  const m = await findMemberForBilling(email);
+  const summary = m
+    ? billingSummaryText(m)
+    : `No Memberful account found for ${email}. They may have joined with a different email, or pay through Whop. Ask for the email they used to sign up.`;
+  await hubspot("PATCH", `/crm/v3/objects/tickets/${ticketId}`, {
+    properties: { hdn_member_email: email, hdn_billing_summary: summary },
+  });
+  return { ticketId, email, found: !!m };
+}
+
+// Hourly (after the billing sync): refresh open tickets touched in the last 14 days
+async function refreshOpenTicketSummaries() {
+  const since = Date.now() - 14 * 86400 * 1000;
+  let after, done = 0;
+  for (let page = 0; page < 5; page++) {
+    const r = await hubspot("POST", "/crm/v3/objects/tickets/search", {
+      filterGroups: [{ filters: [
+        { propertyName: "hs_pipeline_stage", operator: "NEQ", value: "4" },
+        { propertyName: "hs_lastmodifieddate", operator: "GTE", value: String(since) },
+      ] }],
+      properties: ["hs_pipeline_stage"],
+      limit: 100,
+      ...(after ? { after } : {}),
+    });
+    for (const t of r.results || []) {
+      try { await summarizeTicket(t.id); done++; } catch (e) { console.error("Ticket summary failed", t.id, String(e.message || e).slice(0, 200)); }
+      await new Promise((res) => setTimeout(res, 250));
+    }
+    after = r.paging?.next?.after;
+    if (!after) break;
+  }
+  console.log(`Ticket billing summaries refreshed: ${done}`);
+}
+
+// Manual: POST /admin/ticket-billing {"ticketId":"123"} or {"mode":"open"} (header x-admin-token)
+app.post("/admin/ticket-billing", async (req, res) => {
+  if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
+  let body = {};
+  try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
+  try {
+    if (body.ticketId) return res.json(await summarizeTicket(String(body.ticketId)));
+    if (body.mode === "open") { refreshOpenTicketSummaries(); return res.json({ started: true }); }
+    res.status(400).json({ error: 'send {"ticketId":"..."} or {"mode":"open"}' });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 // HubSpot private app webhook: ticket.propertyChange on duplicate_cleanup
 app.post("/hubspot/duplicate-cleanup", (req, res) => {
   if (!verifyHubSpot(req)) return res.status(401).json({ error: "unauthorized" });
@@ -758,6 +869,11 @@ app.post("/hubspot/duplicate-cleanup", (req, res) => {
   res.sendStatus(200);
 
   for (const e of Array.isArray(events) ? events : []) {
+    // New ticket: add the member's billing summary (short wait so the contact is associated)
+    if (e.subscriptionType === "ticket.creation") {
+      setTimeout(() => summarizeTicket(String(e.objectId)).catch((err) => console.error("Ticket summary failed:", err)), 5000);
+      continue;
+    }
     const mode = (e.propertyValue || "").toLowerCase();
     if (e.propertyName !== "duplicate_cleanup") continue;
     if (mode === "find by name") {
