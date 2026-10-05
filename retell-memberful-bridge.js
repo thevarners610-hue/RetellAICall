@@ -617,6 +617,33 @@ function membershipProps(m, f) {
   };
 }
 
+
+// Upsert contacts in a batch; if HubSpot rejects some emails as invalid (e.g. "gmail.con"),
+// drop just those and retry, so one bad email doesn't sink the other 99.
+const badEmails = new Set();
+async function upsertContactsBatch(inputs) {
+  let list = inputs.filter((x) => !badEmails.has(x.id));
+  for (let attempt = 0; attempt < 4 && list.length; attempt++) {
+    try {
+      await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", { inputs: list });
+      return { written: list.length, skipped: inputs.length - list.length };
+    } catch (e) {
+      const msg = String(e.message || e);
+      const found = [...msg.matchAll(/Email address ([^\s\\"]+) is invalid/g)].map((x) => x[1].toLowerCase());
+      if (!found.length) throw e;
+      found.forEach((f) => badEmails.add(f));
+      list = list.filter((x) => !badEmails.has(x.id));
+    }
+  }
+  // Still failing: send one at a time so the good ones get through
+  let written = 0;
+  for (const one of list) {
+    try { await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", { inputs: [one] }); written++; }
+    catch { badEmails.add(one.id); }
+  }
+  return { written, skipped: inputs.length - written };
+}
+
 async function syncBillingToHubSpot() {
   const now = Date.now() / 1000;
   const cutoff = now - 120 * 86400;
@@ -654,11 +681,12 @@ async function syncBillingToHubSpot() {
   for (let i = 0; i < changed.length; i += 100) {
     const batch = changed.slice(i, i + 100);
     try {
-      await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", {
-        inputs: batch.map((c) => ({ idProperty: "email", id: c.email, properties: { email: c.email, ...c.facts, memberful_last_updated: today } })),
-      });
-      for (const c of batch) billingState.lastSent.set(c.email, c.key);
-      written += batch.length;
+      const r = await upsertContactsBatch(
+        batch.map((c) => ({ idProperty: "email", id: c.email, properties: { email: c.email, ...c.facts, memberful_last_updated: today } }))
+      );
+      for (const c of batch) if (!badEmails.has(c.email)) billingState.lastSent.set(c.email, c.key);
+      written += r.written;
+      failed += r.skipped;
     } catch (e) {
       failed += batch.length;
       console.error("Billing sync batch failed:", String(e.message || e).slice(0, 300));
@@ -666,7 +694,7 @@ async function syncBillingToHubSpot() {
     await new Promise((r) => setTimeout(r, 300));
   }
   billingState.primed = true;
-  console.log(`Billing sync: ${written} contacts updated, ${failed} failed, ${billingState.offDate.size} cancellations tracked`);
+  console.log(`Billing sync: ${written} contacts updated, ${failed} skipped (${badEmails.size} invalid emails like "gmail.con"), ${billingState.offDate.size} cancellations tracked`);
 
   // Same facts into the "HDN Membership" custom object, which HubSpot's AI agent can search
   const objectType = process.env.HDN_MEMBERSHIP_OBJECT; // e.g. 2-12345678 (from the custom object's settings)
@@ -1077,8 +1105,8 @@ async function syncTrialsToHubSpot() {
           trial_auto_renew: t.active && t.autorenew ? "true" : "false",
         },
       }));
-      await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", { inputs });
-      upserted += inputs.length;
+      const r = await upsertContactsBatch(inputs);
+      upserted += r.written;
     }
     console.log(`Trial sync: ${upserted} trial contacts updated in HubSpot`);
     return { upserted };
