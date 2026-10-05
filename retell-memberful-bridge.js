@@ -588,6 +588,7 @@ function billingFacts(m) {
     hdn_last_payment_amount: lastPaid ? String(lastPaid.totalCents / 100) : "",
     hdn_access_ends: (onTrial ? sub.trialEndAt : sub.expiresAt) ? String(prDateMs(onTrial ? sub.trialEndAt : sub.expiresAt)) : "",
     hdn_member_since: firstSub ? String(prDateMs(firstSub)) : "",
+    hdn_discord_user_id: m.discordUserId ? String(m.discordUserId) : "",
   };
 }
 
