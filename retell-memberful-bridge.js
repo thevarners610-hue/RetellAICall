@@ -856,6 +856,16 @@ async function summarizeTicket(ticketId) {
   await hubspot("PATCH", `/crm/v3/objects/tickets/${ticketId}`, {
     properties: { hdn_member_email: email, hdn_billing_summary: summary },
   });
+  // Also make sure this member has an up-to-date HDN Membership record right away,
+  // so the AI agent can find them even before the next hourly sync
+  if (m && process.env.HDN_MEMBERSHIP_OBJECT) {
+    const facts = billingFacts(m);
+    if (facts) {
+      await hubspot("POST", `/crm/v3/objects/${process.env.HDN_MEMBERSHIP_OBJECT}/batch/upsert`, {
+        inputs: [{ idProperty: "member_email", id: email, properties: membershipProps({ ...m, email }, facts) }],
+      }).catch((e) => console.error("Membership record upsert failed:", String(e.message || e).slice(0, 200)));
+    }
+  }
   return { ticketId, email, found: !!m };
 }
 
@@ -927,6 +937,29 @@ app.post("/admin/create-membership-object", async (req, res) => {
       ],
     });
     res.json({ objectTypeId: schema.objectTypeId, fullyQualifiedName: schema.fullyQualifiedName, next: "Set HDN_MEMBERSHIP_OBJECT to objectTypeId in Railway" });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+
+// Manual: POST /admin/membership {"email":"x@y.com"} -> create/refresh that member's HDN Membership record
+app.post("/admin/membership", async (req, res) => {
+  if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
+  let body = {};
+  try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
+  const email = String(body.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "email required" });
+  if (!process.env.HDN_MEMBERSHIP_OBJECT) return res.status(400).json({ error: "HDN_MEMBERSHIP_OBJECT is not set in Railway" });
+  try {
+    const m = await findMemberForBilling(email);
+    if (!m) return res.json({ email, found: false });
+    const facts = billingFacts(m);
+    if (!facts) return res.json({ email, found: true, written: false, reason: "no subscriptions" });
+    await hubspot("POST", `/crm/v3/objects/${process.env.HDN_MEMBERSHIP_OBJECT}/batch/upsert`, {
+      inputs: [{ idProperty: "member_email", id: email, properties: membershipProps({ ...m, email }, facts) }],
+    });
+    res.json({ email, found: true, written: true, summary: billingSummaryText({ ...m, email }) });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
