@@ -503,7 +503,7 @@ const MEMBERS_PAGE = `
   query ($after: String) {
     members(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
-      edges { node { id fullName email discordUserId subscriptions { ${SUB_FIELDS} } } }
+      edges { node { id fullName email discordUserId orders { createdAt totalCents status } subscriptions { ${SUB_FIELDS} } } }
     }
   }`;
 
@@ -538,9 +538,108 @@ async function refreshMemberIndex({ full = false } = {}) {
 }
 
 // Build at startup, pick up new members hourly, full rebuild every 24 hours
-setTimeout(() => refreshMemberIndex({ full: true }), 30 * 1000);
-setInterval(() => refreshMemberIndex(), 60 * 60 * 1000);
-setInterval(() => refreshMemberIndex({ full: true }), 24 * 60 * 60 * 1000);
+// Full refresh at startup and every hour (so billing changes like auto-renew are caught),
+// then push billing facts to HubSpot contacts
+async function refreshAndSyncBilling() {
+  await refreshMemberIndex({ full: true });
+  if (memberIndex.ready) await syncBillingToHubSpot().catch((e) => console.error("Billing sync failed:", e));
+}
+setTimeout(refreshAndSyncBilling, 30 * 1000);
+setInterval(refreshAndSyncBilling, 60 * 60 * 1000);
+
+
+// ---------------------------------------------------------------------------
+// Billing facts -> HubSpot contacts (hourly, after the member index refresh)
+// So HubSpot's AI agent (and your team) can see plan, auto-renew, last payment,
+// access end date, and when auto-renew was turned off, right on the contact.
+// Only members who are active or ended within the last 120 days are synced,
+// and only contacts whose billing facts changed are written.
+// ---------------------------------------------------------------------------
+
+const billingState = { lastSent: new Map(), prevAutoRenew: new Map(), offDate: new Map(), primed: false };
+
+function primarySub(m) {
+  const subs = sortSubs(m.subscriptions);
+  return subs[0] || null;
+}
+
+function billingFacts(m) {
+  const sub = primarySub(m);
+  if (!sub) return null;
+  const now = Date.now() / 1000;
+  const onTrial = sub.active && sub.trialEndAt && sub.trialEndAt > now;
+  let status = "ended";
+  if (sub.active && sub.pastDue) status = "past_due";
+  else if (onTrial) status = "trial";
+  else if (sub.active && !sub.autorenew) status = "canceled_with_access";
+  else if (sub.active) status = "active";
+
+  const paid = (m.orders || []).filter((o) => o.status === "completed" && (o.totalCents || 0) > 0)
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const lastPaid = paid[0];
+  const firstSub = (m.subscriptions || []).reduce((min, x) => (x.createdAt && (!min || x.createdAt < min) ? x.createdAt : min), 0);
+  const price = planPrice(sub.plan);
+
+  return {
+    hdn_plan: `${sub.plan?.name || "Unknown plan"}${price ? ` (${price})` : ""}`,
+    hdn_membership_status: status,
+    hdn_auto_renew: sub.active && sub.autorenew ? "true" : "false",
+    hdn_last_payment_date: lastPaid ? String(prDateMs(lastPaid.createdAt)) : "",
+    hdn_last_payment_amount: lastPaid ? String(lastPaid.totalCents / 100) : "",
+    hdn_access_ends: (onTrial ? sub.trialEndAt : sub.expiresAt) ? String(prDateMs(onTrial ? sub.trialEndAt : sub.expiresAt)) : "",
+    hdn_member_since: firstSub ? String(prDateMs(firstSub)) : "",
+  };
+}
+
+async function syncBillingToHubSpot() {
+  const now = Date.now() / 1000;
+  const cutoff = now - 120 * 86400;
+  const today = String(prDateMs(Math.floor(now)));
+  const changed = [];
+
+  for (const m of memberIndex.byId.values()) {
+    const email = (m.email || "").trim().toLowerCase();
+    if (!email || email.startsWith("test@")) continue;
+    const sub = primarySub(m);
+    if (!sub) continue;
+    if (!sub.active && !(sub.expiresAt && sub.expiresAt > cutoff)) continue;
+
+    // Detect auto-renew switching from on to off (the cancellation moment)
+    const ar = !!(sub.active && sub.autorenew);
+    const prev = billingState.prevAutoRenew.get(m.id);
+    if (billingState.primed && prev === true && ar === false && !billingState.offDate.has(m.id)) {
+      billingState.offDate.set(m.id, today);
+    }
+    if (ar === true) billingState.offDate.delete(m.id); // renewed / turned back on
+    billingState.prevAutoRenew.set(m.id, ar);
+
+    const facts = billingFacts(m);
+    if (!facts) continue;
+    if (billingState.offDate.has(m.id)) facts.hdn_auto_renew_off_date = billingState.offDate.get(m.id);
+
+    const key = JSON.stringify(facts);
+    if (billingState.lastSent.get(email) === key) continue;
+    changed.push({ email, facts, key });
+  }
+
+  let written = 0, failed = 0;
+  for (let i = 0; i < changed.length; i += 100) {
+    const batch = changed.slice(i, i + 100);
+    try {
+      await hubspot("POST", "/crm/v3/objects/contacts/batch/upsert", {
+        inputs: batch.map((c) => ({ idProperty: "email", id: c.email, properties: { email: c.email, ...c.facts } })),
+      });
+      for (const c of batch) billingState.lastSent.set(c.email, c.key);
+      written += batch.length;
+    } catch (e) {
+      failed += batch.length;
+      console.error("Billing sync batch failed:", String(e.message || e).slice(0, 300));
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  billingState.primed = true;
+  console.log(`Billing sync: ${written} contacts updated, ${failed} failed, ${billingState.offDate.size} cancellations tracked`);
+}
 
 function normName(s) {
   return (s || "")
