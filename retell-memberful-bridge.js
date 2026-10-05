@@ -557,7 +557,7 @@ setInterval(refreshAndSyncBilling, 60 * 60 * 1000);
 // and only contacts whose billing facts changed are written.
 // ---------------------------------------------------------------------------
 
-const billingState = { lastSent: new Map(), prevAutoRenew: new Map(), offDate: new Map(), primed: false };
+const billingState = { lastSent: new Map(), lastSentMembership: new Map(), prevAutoRenew: new Map(), offDate: new Map(), primed: false };
 
 function primarySub(m) {
   const subs = sortSubs(m.subscriptions);
@@ -598,11 +598,31 @@ function billingFacts(m) {
   };
 }
 
+
+function membershipProps(m, f) {
+  const day = (ms) => (ms ? new Date(Number(ms)).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric", timeZone: "UTC" }) : "");
+  const off = billingState.offDate.get(m.id);
+  return {
+    member_email: (m.email || "").toLowerCase(),
+    member_name: m.fullName || "",
+    billing_summary: billingSummaryText(m),
+    plan: f.hdn_plan,
+    membership_status: STATUS_TEXT[f.hdn_membership_status],
+    auto_renew: f.hdn_auto_renew === "true" ? "ON" : "OFF",
+    last_payment: f.hdn_last_payment_amount ? `$${Number(f.hdn_last_payment_amount).toFixed(2)} on ${day(f.hdn_last_payment_date)}` : "none on record",
+    access_ends: day(f.hdn_access_ends),
+    auto_renew_turned_off_on: off ? day(off) : f.hdn_auto_renew === "true" ? "n/a (still on)" : "not recorded (before Oct 2026)",
+    discord_connected: m.discordUserId ? "Yes" : "No",
+    memberful_id: String(m.id),
+  };
+}
+
 async function syncBillingToHubSpot() {
   const now = Date.now() / 1000;
   const cutoff = now - 120 * 86400;
   const today = String(prDateMs(Math.floor(now)));
   const changed = [];
+  const all = [];
 
   for (const m of memberIndex.byId.values()) {
     const email = (m.email || "").trim().toLowerCase();
@@ -625,8 +645,9 @@ async function syncBillingToHubSpot() {
     if (billingState.offDate.has(m.id)) facts.hdn_auto_renew_off_date = billingState.offDate.get(m.id);
 
     const key = JSON.stringify(facts);
+    all.push({ email, facts, key, m });
     if (billingState.lastSent.get(email) === key) continue;
-    changed.push({ email, facts, key });
+    changed.push({ email, facts, key, m });
   }
 
   let written = 0, failed = 0;
@@ -646,6 +667,28 @@ async function syncBillingToHubSpot() {
   }
   billingState.primed = true;
   console.log(`Billing sync: ${written} contacts updated, ${failed} failed, ${billingState.offDate.size} cancellations tracked`);
+
+  // Same facts into the "HDN Membership" custom object, which HubSpot's AI agent can search
+  const objectType = process.env.HDN_MEMBERSHIP_OBJECT; // e.g. 2-12345678 (from the custom object's settings)
+  if (objectType) {
+    let ok = 0, bad = 0;
+    const toSend = all.filter((c) => billingState.lastSentMembership.get(c.email) !== c.key);
+    for (let i = 0; i < toSend.length; i += 100) {
+      const batch = toSend.slice(i, i + 100);
+      try {
+        await hubspot("POST", `/crm/v3/objects/${objectType}/batch/upsert`, {
+          inputs: batch.map((c) => ({ idProperty: "member_email", id: c.email, properties: membershipProps(c.m, c.facts) })),
+        });
+        for (const c of batch) billingState.lastSentMembership.set(c.email, c.key);
+        ok += batch.length;
+      } catch (e) {
+        bad += batch.length;
+        console.error("Membership object sync failed:", String(e.message || e).slice(0, 300));
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    console.log(`Membership records: ${ok} updated, ${bad} failed`);
+  }
 }
 
 function normName(s) {
@@ -849,6 +892,41 @@ app.post("/admin/ticket-billing", async (req, res) => {
     if (body.ticketId) return res.json(await summarizeTicket(String(body.ticketId)));
     if (body.mode === "open") { refreshOpenTicketSummaries(); return res.json({ started: true }); }
     res.status(400).json({ error: 'send {"ticketId":"..."} or {"mode":"open"}' });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+
+// One-time: create the "HDN Membership" custom object (needs scope crm.schemas.custom.write)
+//   POST /admin/create-membership-object   header x-admin-token
+app.post("/admin/create-membership-object", async (req, res) => {
+  if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
+  const text = (name, label, extra = {}) => ({ name, label, type: "string", fieldType: "text", ...extra });
+  try {
+    const schema = await hubspot("POST", "/crm/v3/schemas", {
+      name: "hdn_membership",
+      labels: { singular: "HDN Membership", plural: "HDN Memberships" },
+      primaryDisplayProperty: "member_email",
+      secondaryDisplayProperties: ["membership_status"],
+      searchableProperties: ["member_email", "member_name"],
+      requiredProperties: ["member_email"],
+      associatedObjects: ["CONTACT", "TICKET"],
+      properties: [
+        text("member_email", "Member email", { hasUniqueValue: true }),
+        text("member_name", "Member name"),
+        { name: "billing_summary", label: "Billing summary", type: "string", fieldType: "textarea" },
+        text("plan", "Plan"),
+        text("membership_status", "Membership status"),
+        text("auto_renew", "Auto-renew"),
+        text("last_payment", "Last payment"),
+        text("access_ends", "Access ends / renews on"),
+        text("auto_renew_turned_off_on", "Auto-renew turned off on"),
+        text("discord_connected", "Discord connected"),
+        text("memberful_id", "Memberful member ID"),
+      ],
+    });
+    res.json({ objectTypeId: schema.objectTypeId, fullyQualifiedName: schema.fullyQualifiedName, next: "Set HDN_MEMBERSHIP_OBJECT to objectTypeId in Railway" });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
