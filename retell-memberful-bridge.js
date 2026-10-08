@@ -8,6 +8,8 @@
 //    thread, then close it (POST /admin/backlog-reply)
 //  - Daily dispute alert (9 AM Puerto Rico): posts Stripe disputes that need a
 //    response soon as a phone/computer push notification and/or email
+//  - Auto-merge duplicate tickets: a new ticket from someone who already has an
+//    open ticket is merged into it and keeps that owner (plus an hourly sweep)
 //  - Trial sync (hourly): copies Memberful trial end dates to HubSpot contacts
 //    so a HubSpot workflow can send a reminder before the trial converts
 // Deploy on Railway. Env vars:
@@ -543,6 +545,7 @@ async function refreshMemberIndex({ full = false } = {}) {
 async function refreshAndSyncBilling() {
   await refreshMemberIndex({ full: true });
   if (memberIndex.ready) await syncBillingToHubSpot().catch((e) => console.error("Billing sync failed:", e));
+  if (MERGE.enabled) await sweepDuplicateTickets().catch((e) => console.error("Duplicate ticket sweep failed:", e));
   if (memberIndex.ready) await refreshOpenTicketSummaries().catch((e) => console.error("Ticket summaries failed:", e));
 }
 setTimeout(refreshAndSyncBilling, 30 * 1000);
@@ -1010,7 +1013,8 @@ app.post("/hubspot/duplicate-cleanup", (req, res) => {
   for (const e of Array.isArray(events) ? events : []) {
     // New ticket: add the member's billing summary (short wait so the contact is associated)
     if (e.subscriptionType === "ticket.creation") {
-      setTimeout(() => summarizeTicket(String(e.objectId)).catch((err) => console.error("Ticket summary failed:", err)), 5000);
+      // Merge into an existing open ticket first (same person = one ticket), then add the billing summary
+      setTimeout(() => handleNewTicket(String(e.objectId)).catch((err) => console.error("New ticket handling failed:", err)), 8000);
       continue;
     }
     const mode = (e.propertyValue || "").toLowerCase();
@@ -1473,6 +1477,233 @@ app.post("/admin/backlog-reply", async (req, res) => {
 app.get("/admin/backlog-reply/status", (req, res) => {
   if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
   res.json(backlogRun);
+});
+
+// ---------------------------------------------------------------------------
+// Auto-merge duplicate tickets (one person = one open ticket = one agent)
+//
+// When a new ticket is created for a contact who already has an open ticket,
+// the new ticket is merged into the existing one and the existing owner is
+// kept. An hourly sweep catches anything the webhook missed.
+//
+// Which ticket is kept:
+//   1. one a teammate owns AND has already replied on
+//   2. otherwise one a teammate owns
+//   3. otherwise the oldest (e.g. both are with HD Support AI)
+//   ties go to the oldest ticket.
+//
+// Env (optional):
+//   AUTO_MERGE_TICKETS=off     turns all of this off
+//   NON_HUMAN_OWNER_IDS        owners that aren't a person
+//                              (default: HD Support AI, Honey Drip Support)
+//
+// Manual:  POST /admin/merge-duplicates  header x-admin-token
+//   {"mode":"dry"}  -> list who has duplicates and what would be kept
+//   {"mode":"run"}  -> merge them now
+// ---------------------------------------------------------------------------
+
+const MERGE = {
+  enabled: process.env.AUTO_MERGE_TICKETS !== "off",
+  closedStage: "4",
+  waitingOnUsStage: "3",
+  nonHumanOwners: (process.env.NON_HUMAN_OWNER_IDS || "86933385,86799246")
+    .split(",").map((x) => x.trim()).filter(Boolean),
+};
+
+const TICKET_PROPS = [
+  "subject", "hubspot_owner_id", "hs_pipeline", "hs_pipeline_stage",
+  "createdate", "hs_first_agent_message_sent_by",
+];
+
+// One merge at a time per contact, so two tickets created seconds apart
+// (Adrian sent the form 3 times) can't try to merge into each other
+const mergeLocks = new Map();
+function withContactLock(contactId, fn) {
+  const prev = mergeLocks.get(contactId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  mergeLocks.set(contactId, next);
+  next.finally(() => { if (mergeLocks.get(contactId) === next) mergeLocks.delete(contactId); }).catch(() => {});
+  return next;
+}
+
+const isHumanOwner = (ownerId) => !!ownerId && !MERGE.nonHumanOwners.includes(String(ownerId));
+
+async function openTicketsForContact(contactId) {
+  const a = await hubspot("GET", `/crm/v4/objects/contacts/${contactId}/associations/tickets?limit=100`);
+  const ids = [...new Set((a.results || []).map((r) => String(r.toObjectId)))];
+  if (!ids.length) return [];
+  const r = await hubspot("POST", "/crm/v3/objects/tickets/batch/read", {
+    properties: TICKET_PROPS,
+    inputs: ids.map((id) => ({ id })),
+  });
+  return (r.results || []).filter((t) => t.properties?.hs_pipeline_stage !== MERGE.closedStage);
+}
+
+function pickPrimary(tickets) {
+  const rank = (t) => {
+    const p = t.properties || {};
+    const human = isHumanOwner(p.hubspot_owner_id);
+    const humanReplied = human && isHumanOwner(p.hs_first_agent_message_sent_by);
+    return humanReplied ? 0 : human ? 1 : 2;
+  };
+  return [...tickets].sort(
+    (a, b) => rank(a) - rank(b) || new Date(a.properties.createdate) - new Date(b.properties.createdate)
+  )[0];
+}
+
+function ticketLabel(t) {
+  const p = t.properties || {};
+  const when = p.createdate ? new Date(p.createdate).toLocaleString("en-US", { timeZone: "America/Puerto_Rico", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "?";
+  return `#${t.id} "${p.subject || "no subject"}" (created ${when})`;
+}
+
+// Merge `dupes` into `primary`, then put the kept owner back (HubSpot's merge
+// can switch the owner to the duplicate's owner) and leave a note on the ticket.
+async function mergeInto(primary, dupes, { contactId, memberWroteAgain }) {
+  const owner = primary.properties?.hubspot_owner_id || "";
+  let keepId = String(primary.id);
+  const merged = [];
+  const failed = [];
+
+  for (const d of dupes) {
+    if (String(d.id) === keepId) continue;
+    if (d.properties?.hs_pipeline !== primary.properties?.hs_pipeline) {
+      failed.push(`${ticketLabel(d)}: different pipeline, left as is`);
+      continue;
+    }
+    try {
+      const r = await hubspot("POST", "/crm/v3/objects/tickets/merge", {
+        primaryObjectId: keepId,
+        objectIdToMerge: String(d.id),
+      });
+      keepId = String(r.id || keepId); // HubSpot gives the merged ticket a new id
+      merged.push(d);
+    } catch (e) {
+      failed.push(`${ticketLabel(d)}: merge failed (${String(e.message || e).slice(0, 150)})`);
+    }
+    await new Promise((res) => setTimeout(res, 300));
+  }
+  if (!merged.length) {
+    if (failed.length) console.error("Auto-merge failed:", failed.join(" | "));
+    return null;
+  }
+
+  const props = {};
+  if (owner) props.hubspot_owner_id = owner;
+  // The member just wrote in again, so a teammate's ticket should show as "Waiting on us"
+  if (memberWroteAgain && isHumanOwner(owner)) props.hs_pipeline_stage = MERGE.waitingOnUsStage;
+  if (Object.keys(props).length) {
+    await hubspot("PATCH", `/crm/v3/objects/tickets/${keepId}`, { properties: props });
+  }
+
+  await addNote(
+    keepId,
+    contactId,
+    `<b>Duplicate tickets merged</b><br>This member had more than one open ticket, so they were merged into this one and it stays with its current owner.<br><br>` +
+      `Kept: ${ticketLabel(primary)}<br>Merged in:<br>${merged.map((d) => `&nbsp;&nbsp;• ${ticketLabel(d)}`).join("<br>")}` +
+      (failed.length ? `<br><br>Not merged:<br>${failed.map((f) => `&nbsp;&nbsp;• ${f}`).join("<br>")}` : "")
+  ).catch((e) => console.error("Merge note failed:", String(e.message || e).slice(0, 200)));
+
+  console.log(`Auto-merge: contact ${contactId}, kept ${primary.id} -> ${keepId}, merged ${merged.map((d) => d.id).join(", ")}`);
+  return keepId;
+}
+
+// Called for every new ticket. Returns the id to use afterwards (new id if merged).
+async function mergeNewTicket(ticketId) {
+  const t = await hubspot(
+    "GET",
+    `/crm/v3/objects/tickets/${ticketId}?properties=${TICKET_PROPS.join(",")}&associations=contacts`
+  );
+  const contactId = t.associations?.contacts?.results?.[0]?.id;
+  if (!contactId) return null;
+
+  return withContactLock(String(contactId), async () => {
+    const open = await openTicketsForContact(contactId);
+    const fresh = open.find((x) => String(x.id) === String(ticketId));
+    if (!fresh) return null; // already merged or closed
+    const existing = open.filter((x) => String(x.id) !== String(ticketId));
+    if (!existing.length) return null; // first open ticket for this person
+    const primary = pickPrimary(existing); // never the brand-new ticket
+    const dupes = [...existing.filter((x) => x.id !== primary.id), fresh];
+    return mergeInto(primary, dupes, { contactId, memberWroteAgain: true });
+  });
+}
+
+// New-ticket webhook: merge first, then write the billing summary on whatever ticket survives
+async function handleNewTicket(ticketId) {
+  let id = ticketId;
+  if (MERGE.enabled) {
+    try {
+      id = (await mergeNewTicket(ticketId)) || ticketId;
+    } catch (e) {
+      console.error("Auto-merge on new ticket failed:", String(e.message || e).slice(0, 300));
+    }
+  }
+  await summarizeTicket(String(id));
+}
+
+// Hourly sweep (and manual dry run): every contact with 2+ open tickets
+async function sweepDuplicateTickets({ dry = false } = {}) {
+  const tickets = [];
+  let after;
+  for (let page = 0; page < 20; page++) {
+    const r = await hubspot("POST", "/crm/v3/objects/tickets/search", {
+      filterGroups: [{ filters: [{ propertyName: "hs_pipeline_stage", operator: "NEQ", value: MERGE.closedStage }] }],
+      properties: TICKET_PROPS,
+      limit: 100,
+      ...(after ? { after } : {}),
+    });
+    tickets.push(...(r.results || []));
+    after = r.paging?.next?.after;
+    if (!after) break;
+    await new Promise((res) => setTimeout(res, 300));
+  }
+
+  const byContact = new Map();
+  const byId = new Map(tickets.map((t) => [String(t.id), t]));
+  for (let i = 0; i < tickets.length; i += 100) {
+    const r = await hubspot("POST", "/crm/v4/associations/tickets/contacts/batch/read", {
+      inputs: tickets.slice(i, i + 100).map((t) => ({ id: String(t.id) })),
+    });
+    for (const row of r.results || []) {
+      const c = row.to?.[0]?.toObjectId;
+      if (!c) continue;
+      const key = String(c);
+      if (!byContact.has(key)) byContact.set(key, []);
+      byContact.get(key).push(byId.get(String(row.from?.id)));
+    }
+  }
+
+  const groups = [...byContact].filter(([, ts]) => ts.filter(Boolean).length > 1);
+  const report = [];
+  for (const [contactId, ts] of groups) {
+    const primary = pickPrimary(ts.filter(Boolean));
+    if (dry) {
+      report.push({ contactId, keep: ticketLabel(primary), merge: ts.filter((t) => t && t.id !== primary.id).map(ticketLabel) });
+      continue;
+    }
+    const keptId = await withContactLock(contactId, async () => {
+      const open = await openTicketsForContact(contactId); // re-read in case the webhook already merged
+      if (open.length < 2) return null;
+      const p = pickPrimary(open);
+      return mergeInto(p, open.filter((x) => x.id !== p.id), { contactId, memberWroteAgain: false });
+    }).catch((e) => { console.error("Sweep merge failed for contact", contactId, String(e.message || e).slice(0, 200)); return null; });
+    report.push({ contactId, keptId });
+  }
+  console.log(`Duplicate ticket sweep${dry ? " (dry run)" : ""}: ${tickets.length} open tickets, ${groups.length} people with duplicates`);
+  return { openTickets: tickets.length, peopleWithDuplicates: groups.length, report };
+}
+
+app.post("/admin/merge-duplicates", async (req, res) => {
+  if (!adminOk(req)) return res.status(401).json({ error: "unauthorized" });
+  let body = {};
+  try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
+  if (body.mode !== "dry" && body.mode !== "run") return res.status(400).json({ error: 'mode must be "dry" or "run"' });
+  try {
+    res.json(await sweepDuplicateTickets({ dry: body.mode === "dry" }));
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 app.listen(process.env.PORT || 3000);
