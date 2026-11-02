@@ -505,7 +505,7 @@ const MEMBERS_PAGE = `
   query ($after: String) {
     members(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
-      edges { node { id fullName email discordUserId orders { createdAt totalCents status } subscriptions { ${SUB_FIELDS} } } }
+      edges { node { id fullName email phoneNumber discordUserId orders { createdAt totalCents status } subscriptions { ${SUB_FIELDS} } } }
     }
   }`;
 
@@ -547,6 +547,7 @@ async function refreshAndSyncBilling() {
   if (memberIndex.ready) await syncBillingToHubSpot().catch((e) => console.error("Billing sync failed:", e));
   if (MERGE.enabled) await sweepDuplicateTickets().catch((e) => console.error("Duplicate ticket sweep failed:", e));
   if (memberIndex.ready) await refreshOpenTicketSummaries().catch((e) => console.error("Ticket summaries failed:", e));
+  if (memberIndex.ready) await syncActiveMembersToSlickText().catch((e) => console.error("SlickText sync failed:", e));
 }
 setTimeout(refreshAndSyncBilling, 30 * 1000);
 setInterval(refreshAndSyncBilling, 60 * 60 * 1000);
@@ -1704,6 +1705,203 @@ app.post("/admin/merge-duplicates", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Memberful -> SlickText "active members" list (hourly, after the member index refresh)
+// Members with an active subscription (incl. trials and cancelled-but-still-has-access)
+// and a US phone number are added to the list; members whose access ended in the last
+// 120 days are removed from it. Contacts who texted STOP are never re-subscribed or added.
+//
+// Env: SLICKTEXT_API_KEY (required), SLICKTEXT_SYNC_MODE = "dry" (default: log only) or "live",
+//      optional SLICKTEXT_BRAND_ID (29910), SLICKTEXT_ACTIVE_LIST_ID (119268), SLICKTEXT_API_BASE.
+// Run on demand: POST /admin/slicktext-sync  (header x-admin-token, body {"mode":"dry"|"live"})
+// ---------------------------------------------------------------------------
+
+const ST = {
+  base: (process.env.SLICKTEXT_API_BASE || "https://dev.slicktext.com/v1").replace(/\/$/, ""),
+  brand: process.env.SLICKTEXT_BRAND_ID || "29910",
+  list: Number(process.env.SLICKTEXT_ACTIVE_LIST_ID || 119268),
+};
+const stState = {
+  running: false,
+  contactByPhone: new Map(), // +1XXXXXXXXXX -> { id, optIn }
+  onList: new Set(),         // phones this process has confirmed on the list
+  offList: new Set(),        // phones this process has confirmed removed
+  last: null,
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function toE164US(raw) {
+  const d = String(raw || "").replace(/\D/g, "");
+  if (d.length === 10 && !/^[01]/.test(d)) return `+1${d}`;
+  if (d.length === 11 && d.startsWith("1") && !/^[01]/.test(d.slice(1))) return `+${d}`;
+  return null;
+}
+
+async function slick(method, path, body, retry = true) {
+  const r = await fetch(`${ST.base}/brands/${ST.brand}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.SLICKTEXT_API_KEY}`,
+      Accept: "application/json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  if (r.status === 429 && retry) {
+    await sleep(Number(r.headers.get("retry-after") || 2) * 1000);
+    return slick(method, path, body, false);
+  }
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch {}
+  if (!r.ok) {
+    const e = new Error(`SlickText ${method} ${path} -> ${r.status}: ${text.slice(0, 300)}`);
+    e.status = r.status;
+    throw e;
+  }
+  return json;
+}
+
+const asList = (j) => (Array.isArray(j) ? j : Array.isArray(j?.data) ? j.data : j ? [j] : []);
+
+async function findContact(phone) {
+  if (stState.contactByPhone.has(phone)) return stState.contactByPhone.get(phone);
+  const rows = asList(await slick("GET", `/contacts?mobile_number=${encodeURIComponent(phone)}`));
+  const hit = rows.find((c) => c?.mobile_number === phone);
+  const out = hit ? { id: hit.contact_id, optIn: hit.opt_in_status } : null;
+  if (out) stState.contactByPhone.set(phone, out);
+  return out;
+}
+
+async function createContact(phone, m) {
+  const [first, ...rest] = String(m.fullName || "").trim().split(/\s+/);
+  const created = await slick("POST", "/contacts", {
+    mobile_number: phone,
+    first_name: first || undefined,
+    last_name: rest.join(" ") || undefined,
+    email: (m.email || "").trim().toLowerCase() || undefined,
+    opt_in_status: "subscribed",
+  });
+  const c = asList(created)[0];
+  const out = { id: c?.contact_id, optIn: c?.opt_in_status || "subscribed" };
+  if (out.id) stState.contactByPhone.set(phone, out);
+  return out;
+}
+
+async function listChange(method, contactIds) {
+  for (let i = 0; i < contactIds.length; i += 100) {
+    await slick(method, "/lists/contacts", { contacts: contactIds.slice(i, i + 100), lists: [ST.list] });
+    await sleep(300);
+  }
+}
+
+async function syncActiveMembersToSlickText({ mode } = {}) {
+  mode = (mode || process.env.SLICKTEXT_SYNC_MODE || "dry").toLowerCase() === "live" ? "live" : "dry";
+  if (!process.env.SLICKTEXT_API_KEY) return { skipped: "SLICKTEXT_API_KEY not set" };
+  if (stState.running) return { skipped: "already running" };
+  stState.running = true;
+  const started = Date.now();
+  const r = { mode, active: 0, activeWithPhone: 0, ended: 0, toAdd: 0, toRemove: 0, created: 0, added: 0, removed: 0,
+              skippedOptedOut: 0, newContacts: 0, lookupErrors: 0, errors: [] };
+  try {
+    const now = Date.now() / 1000;
+    const cutoff = now - 120 * 86400;
+    const want = new Map();  // phone -> member (should be on list)
+    const drop = new Map();  // phone -> member (access ended recently)
+    for (const m of memberIndex.byId.values()) {
+      const email = (m.email || "").toLowerCase();
+      if (email.startsWith("test@")) continue;
+      const subs = m.subscriptions || [];
+      const active = subs.some((s) => s.active);
+      const phone = toE164US(m.phoneNumber);
+      if (active) {
+        r.active++;
+        if (phone) want.set(phone, m);
+      } else if (phone && subs.some((s) => s.expiresAt && s.expiresAt > cutoff)) {
+        drop.set(phone, m);
+      }
+    }
+    for (const p of want.keys()) drop.delete(p); // same phone still active on another account
+    r.activeWithPhone = want.size;
+    r.ended = drop.size;
+
+    const addPhones = [...want.keys()].filter((p) => !stState.onList.has(p));
+    const removePhones = [...drop.keys()].filter((p) => !stState.offList.has(p));
+    r.toAdd = addPhones.length;
+    r.toRemove = removePhones.length;
+
+    // Dry run: check the API works on a small sample, change nothing
+    const sample = mode === "dry" ? addPhones.slice(0, 15) : addPhones;
+    const addIds = [], addedPhones = [];
+    for (const phone of sample) {
+      try {
+        let c = await findContact(phone);
+        if (c && c.optIn !== "subscribed") { r.skippedOptedOut++; continue; }
+        if (!c) {
+          r.newContacts++;
+          if (mode === "dry") continue;
+          c = await createContact(phone, want.get(phone));
+          r.created++;
+        }
+        if (c?.id) { addIds.push(c.id); addedPhones.push(phone); }
+      } catch (e) {
+        r.lookupErrors++;
+        if (r.errors.length < 5) r.errors.push(String(e.message || e));
+        if (e.status === 401 || e.status === 403 || e.status === 404) break; // wrong key / endpoint: stop
+      }
+      await sleep(150);
+    }
+
+    if (mode === "live") {
+      if (addIds.length) {
+        await listChange("POST", addIds);
+        addedPhones.forEach((p) => { stState.onList.add(p); stState.offList.delete(p); });
+        r.added = addIds.length;
+      }
+      const removeIds = [];
+      for (const phone of removePhones) {
+        try {
+          const c = await findContact(phone);
+          if (c?.id) removeIds.push([phone, c.id]);
+          else stState.offList.add(phone); // not in SlickText at all
+        } catch (e) {
+          r.lookupErrors++;
+          if (r.errors.length < 5) r.errors.push(String(e.message || e));
+        }
+        await sleep(150);
+      }
+      if (removeIds.length) {
+        await listChange("DELETE", removeIds.map((x) => x[1]));
+        removeIds.forEach(([p]) => { stState.offList.add(p); stState.onList.delete(p); });
+        r.removed = removeIds.length;
+      }
+    }
+  } catch (e) {
+    r.errors.push(String(e.message || e));
+  } finally {
+    stState.running = false;
+    r.seconds = Math.round((Date.now() - started) / 1000);
+    stState.last = { at: new Date().toISOString(), ...r };
+    console.log("SlickText sync:", JSON.stringify(r));
+  }
+  return r;
+}
+
+app.post("/admin/slicktext-sync", async (req, res) => {
+  if (!process.env.ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  let body = {};
+  try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
+  res.json(await syncActiveMembersToSlickText({ mode: body.mode }));
+});
+app.get("/admin/slicktext-sync/status", (req, res) => {
+  if (!process.env.ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  res.json(stState.last || { note: "not run yet" });
 });
 
 app.listen(process.env.PORT || 3000);
