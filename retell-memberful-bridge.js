@@ -1928,9 +1928,25 @@ async function retellApi(method, path, body) {
 const REMINDER_AGENT_NAME = "Riya Reminders (Asia only)";
 let reminderAgentId = process.env.RETELL_REMINDER_AGENT_ID || null;
 
+async function listAll(method, path) {
+  const out = []; let key;
+  for (let i = 0; i < 10; i++) {
+    const body = method === "POST" ? { limit: 100, ...(key ? { pagination_key: key } : {}) } : undefined;
+    const q = method === "GET" ? `?limit=100${key ? `&pagination_key=${encodeURIComponent(key)}` : ""}` : "";
+    const d = await retellApi(method, path + q, body);
+    const items = Array.isArray(d) ? d : d?.items || [];
+    out.push(...items);
+    if (Array.isArray(d) || !d?.has_more || !d?.pagination_key) break;
+    key = d.pagination_key;
+  }
+  return out;
+}
+const listPhoneNumbers = () => listAll("GET", "/v2/list-phone-numbers");
+const listAgents = () => listAll("POST", "/v2/list-agents");
+
 async function pickFromNumber() {
   if (process.env.RETELL_REMINDER_FROM) return process.env.RETELL_REMINDER_FROM;
-  const nums = await retellApi("GET", "/list-phone-numbers");
+  const nums = await listPhoneNumbers();
   const n = (nums || []).find((x) => x.outbound_agent_id || x.inbound_agent_id) || (nums || [])[0];
   if (!n) throw new Error("No Retell phone number on this account");
   return n.phone_number;
@@ -1938,7 +1954,7 @@ async function pickFromNumber() {
 
 async function ensureReminderAgent() {
   if (reminderAgentId) return reminderAgentId;
-  const agents = await retellApi("GET", "/list-agents");
+  const agents = await listAgents();
   const existing = (agents || []).find((a) => a.agent_name === REMINDER_AGENT_NAME);
   if (existing) return (reminderAgentId = existing.agent_id);
   // Reuse the voice of the existing Riya support agent so it sounds the same
@@ -1975,7 +1991,7 @@ function reminderAuthOk(req) {
 app.get("/reminder-call/info", async (req, res) => {
   if (!reminderAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
   try {
-    const [nums, agents] = await Promise.all([retellApi("GET", "/list-phone-numbers"), retellApi("GET", "/list-agents")]);
+    const [nums, agents] = await Promise.all([listPhoneNumbers(), listAgents()]);
     res.json({
       to: process.env.REMINDER_CALL_TO || null,
       reminderAgentId,
