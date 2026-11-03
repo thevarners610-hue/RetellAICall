@@ -1792,7 +1792,8 @@ async function createContact(phone, m) {
 
 async function listChange(method, contactIds) {
   for (let i = 0; i < contactIds.length; i += 100) {
-    await slick(method, "/lists/contacts", { contacts: contactIds.slice(i, i + 100), lists: [ST.list] });
+    // SlickText v2 wants one entry per contact: [{ contact_id, lists: [...] }]
+    await slick(method, "/lists/contacts", contactIds.slice(i, i + 100).map((id) => ({ contact_id: id, lists: [ST.list] })));
     await sleep(300);
   }
 }
