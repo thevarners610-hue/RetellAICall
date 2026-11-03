@@ -1904,4 +1904,113 @@ app.get("/admin/slicktext-sync/status", (req, res) => {
   res.json(stState.last || { note: "not run yet" });
 });
 
+// ---------------------------------------------------------------------------
+// Reminder calls for Asia (Riya calls her and reads her to-do list)
+//   POST /reminder-call   header x-reminder-token: REMINDER_CALL_TOKEN
+//        body {"reminders": "<what Riya should say>", "kind": "daily"|"urgent"}
+//   GET  /reminder-call/info   (same header) -> phone numbers + agents, for setup
+// Always calls REMINDER_CALL_TO (Asia's cell) and nobody else.
+// Env: REMINDER_CALL_TOKEN, REMINDER_CALL_TO (+1706...), optional
+//      RETELL_REMINDER_FROM (+1...), RETELL_REMINDER_AGENT_ID, RETELL_REMINDER_VOICE_ID
+// ---------------------------------------------------------------------------
+const RETELL_BASE = "https://api.retellai.com";
+async function retellApi(method, path, body) {
+  const r = await fetch(RETELL_BASE + path, {
+    method,
+    headers: { Authorization: `Bearer ${process.env.RETELL_API_KEY}`, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = text; }
+  if (!r.ok) throw new Error(`Retell ${method} ${path} ${r.status}: ${typeof data === "string" ? data.slice(0, 300) : JSON.stringify(data).slice(0, 300)}`);
+  return data;
+}
+const REMINDER_AGENT_NAME = "Riya Reminders (Asia only)";
+let reminderAgentId = process.env.RETELL_REMINDER_AGENT_ID || null;
+
+async function pickFromNumber() {
+  if (process.env.RETELL_REMINDER_FROM) return process.env.RETELL_REMINDER_FROM;
+  const nums = await retellApi("GET", "/list-phone-numbers");
+  const n = (nums || []).find((x) => x.outbound_agent_id || x.inbound_agent_id) || (nums || [])[0];
+  if (!n) throw new Error("No Retell phone number on this account");
+  return n.phone_number;
+}
+
+async function ensureReminderAgent() {
+  if (reminderAgentId) return reminderAgentId;
+  const agents = await retellApi("GET", "/list-agents");
+  const existing = (agents || []).find((a) => a.agent_name === REMINDER_AGENT_NAME);
+  if (existing) return (reminderAgentId = existing.agent_id);
+  // Reuse the voice of the existing Riya support agent so it sounds the same
+  let voiceId = process.env.RETELL_REMINDER_VOICE_ID;
+  if (!voiceId) {
+    const riya = (agents || []).find((a) => /riya/i.test(a.agent_name || "")) || (agents || [])[0];
+    voiceId = riya?.voice_id;
+  }
+  if (!voiceId) throw new Error("Could not find a voice to use; set RETELL_REMINDER_VOICE_ID");
+  const llm = await retellApi("POST", "/create-retell-llm", {
+    general_prompt:
+      "You are Riya, Asia Varner's personal assistant at Honey Drip Network. You are calling Asia (the owner) with her reminders. " +
+      "Be warm, upbeat and brief, like a friendly assistant. Read her these reminders clearly, most urgent first, in plain spoken language " +
+      "(no emojis, no reading of symbols, say addresses naturally):\n\n{{reminders}}\n\n" +
+      "After reading them, ask if she wants you to repeat anything. If she asks, repeat it. If she says thanks, bye, or she's good, " +
+      "say a short goodbye and end the call. Keep the whole call under 2 minutes. If you reach voicemail, leave a short message with the " +
+      "most important one or two reminders and say the full list is in her texts. Never discuss anything else, never share member data.",
+    begin_message: "Hey Asia, it's Riya with your reminders. You got a quick minute?",
+  });
+  const agent = await retellApi("POST", "/create-agent", {
+    agent_name: REMINDER_AGENT_NAME,
+    response_engine: { type: "retell-llm", llm_id: llm.llm_id },
+    voice_id: voiceId,
+    end_call_after_silence_ms: 20000,
+    max_call_duration_ms: 240000,
+  });
+  return (reminderAgentId = agent.agent_id);
+}
+
+function reminderAuthOk(req) {
+  return process.env.REMINDER_CALL_TOKEN && req.headers["x-reminder-token"] === process.env.REMINDER_CALL_TOKEN;
+}
+
+app.get("/reminder-call/info", async (req, res) => {
+  if (!reminderAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const [nums, agents] = await Promise.all([retellApi("GET", "/list-phone-numbers"), retellApi("GET", "/list-agents")]);
+    res.json({
+      to: process.env.REMINDER_CALL_TO || null,
+      reminderAgentId,
+      phoneNumbers: (nums || []).map((n) => ({ phone_number: n.phone_number, nickname: n.nickname, inbound_agent_id: n.inbound_agent_id, outbound_agent_id: n.outbound_agent_id })),
+      agents: [...new Map((agents || []).map((a) => [a.agent_id, { agent_id: a.agent_id, agent_name: a.agent_name, voice_id: a.voice_id }])).values()],
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+app.post("/reminder-call", async (req, res) => {
+  if (!reminderAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
+  const to = process.env.REMINDER_CALL_TO;
+  if (!to) return res.status(500).json({ error: "REMINDER_CALL_TO not set" });
+  let body = {};
+  try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
+  const reminders = String(body.reminders || "").trim().slice(0, 3000);
+  if (!reminders) return res.status(400).json({ error: "reminders is required" });
+  try {
+    const agentId = await ensureReminderAgent();
+    const from = await pickFromNumber();
+    const call = await retellApi("POST", "/v2/create-phone-call", {
+      from_number: from,
+      to_number: to,
+      override_agent_id: agentId,
+      retell_llm_dynamic_variables: { reminders },
+      metadata: { purpose: "asia-reminder", kind: body.kind || "daily" },
+    });
+    console.log(`Reminder call placed: ${call.call_id} (${body.kind || "daily"})`);
+    res.json({ ok: true, call_id: call.call_id, from, agent_id: agentId });
+  } catch (e) {
+    console.error("Reminder call failed:", e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
 app.listen(process.env.PORT || 3000);
