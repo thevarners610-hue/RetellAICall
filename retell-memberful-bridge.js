@@ -2166,6 +2166,8 @@ async function ensureReminderAgent() {
     response_engine: { type: "retell-llm", llm_id: llm.llm_id },
     voice_id: voiceId,
     end_call_after_silence_ms: 20000,
+    enable_voicemail_detection: true,
+    voicemail_message: "Hey Asia, it's Riya with your reminders. I'll try you again in about 30 minutes, and your full list is in your texts. Talk soon!",
     max_call_duration_ms: 420000,
   });
   return (reminderAgentId = agent.agent_id);
@@ -2190,27 +2192,59 @@ app.get("/reminder-call/info", async (req, res) => {
   }
 });
 
+// Place one reminder call. If it isn't answered (no answer / busy / voicemail),
+// call back ONCE about 30 minutes later (retries never retry).
+const MISSED = new Set(["dial_no_answer", "dial_busy", "dial_failed", "voicemail_reached", "machine_detected", "error_no_audio_received"]);
+async function placeReminderCall({ extra, kind, isRetry = false }) {
+  const to = process.env.REMINDER_CALL_TO;
+  if (!to) throw new Error("REMINDER_CALL_TO not set");
+  const todos = await listTodos();
+  const todoText = todos.length ? todos.map((t, i) => `${i + 1}. ${t.item}`).join("\n") : "Her list is empty right now.";
+  const agentId = await ensureReminderAgent();
+  const from = await pickFromNumber();
+  const call = await retellApi("POST", "/v2/create-phone-call", {
+    from_number: from,
+    to_number: to,
+    override_agent_id: agentId,
+    retell_llm_dynamic_variables: { extra, todos: todoText },
+    metadata: { purpose: "asia-reminder", kind, retry: isRetry },
+  });
+  console.log(`Reminder call placed: ${call.call_id} (${kind}${isRetry ? ", retry" : ""})`);
+  if (!isRetry) watchForMiss(call.call_id, { extra, kind });
+  return { call_id: call.call_id, from, agent_id: agentId };
+}
+function watchForMiss(callId, args) {
+  let checks = 0;
+  const check = async () => {
+    checks++;
+    try {
+      const c = await retellApi("GET", `/v2/get-call/${callId}`);
+      if (c.call_status !== "ended" && c.call_status !== "error") {
+        if (checks < 10) setTimeout(check, 2 * 60 * 1000);
+        return;
+      }
+      const reason = c.disconnection_reason || "";
+      const talked = (c.duration_ms || 0) > 20000 && !MISSED.has(reason);
+      console.log(`Reminder call ${callId} ended: ${reason} (${Math.round((c.duration_ms || 0) / 1000)}s)`);
+      if (!talked) {
+        console.log("Reminder call missed; calling back once in 30 minutes");
+        setTimeout(() => placeReminderCall({ ...args, isRetry: true }).catch((e) => console.error("Reminder retry failed:", e)), 30 * 60 * 1000);
+      }
+    } catch (e) {
+      console.error("Reminder call check failed:", e);
+      if (checks < 10) setTimeout(check, 2 * 60 * 1000);
+    }
+  };
+  setTimeout(check, 3 * 60 * 1000);
+}
+
 app.post("/reminder-call", async (req, res) => {
   if (!reminderAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
-  const to = process.env.REMINDER_CALL_TO;
-  if (!to) return res.status(500).json({ error: "REMINDER_CALL_TO not set" });
   let body = {};
   try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
   const extra = String(body.extra || body.reminders || "").trim().slice(0, 2000) || "None today.";
   try {
-    const todos = await listTodos();
-    const todoText = todos.length ? todos.map((t, i) => `${i + 1}. ${t.item}`).join("\n") : "Her list is empty right now.";
-    const agentId = await ensureReminderAgent();
-    const from = await pickFromNumber();
-    const call = await retellApi("POST", "/v2/create-phone-call", {
-      from_number: from,
-      to_number: to,
-      override_agent_id: agentId,
-      retell_llm_dynamic_variables: { extra, todos: todoText },
-      metadata: { purpose: "asia-reminder", kind: body.kind || "daily" },
-    });
-    console.log(`Reminder call placed: ${call.call_id} (${body.kind || "daily"})`);
-    res.json({ ok: true, call_id: call.call_id, from, agent_id: agentId });
+    res.json({ ok: true, ...(await placeReminderCall({ extra, kind: body.kind || "daily" })) });
   } catch (e) {
     console.error("Reminder call failed:", e);
     res.status(500).json({ error: String(e.message || e) });
