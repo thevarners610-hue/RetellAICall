@@ -2049,7 +2049,7 @@ async function handleTodoText(msg) {
 }
 app.post("/reminder-list/text", async (req, res) => {
   if (!todoAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
-  try { res.json({ reply: (await handleTodoText(bodyJson(req).message)).slice(0, 900) }); }
+  try { res.json({ reply: (await handleTodoText(bodyJson(req).message || req.query.message)).slice(0, 900) }); }
   catch (e) { console.error(e); res.json({ reply: "Sorry, I couldn't update your list right now. Try again in a bit." }); }
 });
 
