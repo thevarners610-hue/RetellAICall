@@ -1911,9 +1911,121 @@ app.get("/admin/slicktext-sync/status", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Asia's to-do list (used by Riya's reminder calls and texts)
+// Stored as HubSpot tasks owned by Asia with body tag [riya-todo], so it survives
+// restarts and also shows up in HubSpot. Completed = hs_task_status COMPLETED.
+// ---------------------------------------------------------------------------
+const TODO_OWNER = process.env.REMINDER_TODO_OWNER_ID || "86840305";
+const TODO_TAG = "[riya-todo]";
+
+async function listTodos() {
+  const out = []; let after;
+  for (let i = 0; i < 5; i++) {
+    const d = await hubspot("POST", "/crm/v3/objects/tasks/search", {
+      filterGroups: [{ filters: [
+        { propertyName: "hubspot_owner_id", operator: "EQ", value: TODO_OWNER },
+        { propertyName: "hs_task_status", operator: "NEQ", value: "COMPLETED" },
+      ] }],
+      properties: ["hs_task_subject", "hs_task_body", "hs_task_status", "hs_createdate"],
+      sorts: [{ propertyName: "hs_createdate", direction: "ASCENDING" }],
+      limit: 100, ...(after ? { after } : {}),
+    });
+    out.push(...(d.results || []));
+    after = d.paging?.next?.after;
+    if (!after) break;
+  }
+  return out
+    .filter((t) => (t.properties.hs_task_body || "").includes(TODO_TAG))
+    .map((t) => ({ id: t.id, item: t.properties.hs_task_subject }));
+}
+
+async function addTodo(item) {
+  item = String(item || "").trim().slice(0, 200);
+  if (!item) throw new Error("empty item");
+  const existing = await listTodos();
+  const dup = existing.find((t) => t.item.toLowerCase() === item.toLowerCase());
+  if (dup) return { ...dup, duplicate: true };
+  const t = await hubspot("POST", "/crm/v3/objects/tasks", { properties: {
+    hs_task_subject: item,
+    hs_task_body: `${TODO_TAG} Added via Riya`,
+    hs_task_status: "NOT_STARTED",
+    hs_task_type: "TODO",
+    hs_timestamp: new Date().toISOString(),
+    hubspot_owner_id: TODO_OWNER,
+  } });
+  return { id: t.id, item };
+}
+
+const TODO_STOP = new Set("the a an to my i on in for of and with about up off it is be that this get".split(" "));
+const words = (x) => String(x).toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w && !TODO_STOP.has(w));
+function matchTodo(todos, said) {
+  const sw = new Set(words(said));
+  if (!sw.size) return { best: null, scored: [] };
+  const scored = todos.map((t) => {
+    const tw = words(t.item);
+    const hits = tw.filter((w) => sw.has(w) || [...sw].some((s) => s.length > 3 && (w.startsWith(s) || s.startsWith(w)))).length;
+    return { ...t, score: tw.length ? hits / Math.min(tw.length, sw.size) : 0, hits };
+  }).filter((x) => x.hits > 0).sort((a, b) => b.score - a.score || b.hits - a.hits);
+  const best = scored[0] && scored[0].score >= 0.5 && (!scored[1] || scored[0].score > scored[1].score) ? scored[0] : null;
+  return { best, scored };
+}
+
+async function completeTodo(said) {
+  const todos = await listTodos();
+  const { best, scored } = matchTodo(todos, said);
+  if (!best) return { done: false, candidates: scored.slice(0, 3).map((x) => x.item), all: todos.map((t) => t.item) };
+  await hubspot("PATCH", `/crm/v3/objects/tasks/${best.id}`, { properties: { hs_task_status: "COMPLETED" } });
+  return { done: true, item: best.item, remaining: todos.length - 1 };
+}
+
+function todoAuthOk(req) {
+  return process.env.REMINDER_CALL_TOKEN && req.headers["x-reminder-token"] === process.env.REMINDER_CALL_TOKEN;
+}
+function bodyJson(req) {
+  try { return JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch { return {}; }
+}
+// For texts / admin: GET list, POST add {item} or {items:[..]}, POST done {item}
+app.get("/reminder-list", async (req, res) => {
+  if (!todoAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
+  try { const t = await listTodos(); res.json({ count: t.length, items: t.map((x) => x.item) }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/reminder-list/add", async (req, res) => {
+  if (!todoAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
+  const b = bodyJson(req); const items = b.items || (b.item ? [b.item] : []);
+  try { const added = []; for (const i of items) added.push(await addTodo(i)); res.json({ added }); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+app.post("/reminder-list/done", async (req, res) => {
+  if (!todoAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
+  try { res.json(await completeTodo(bodyJson(req).item)); }
+  catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Retell custom functions for the reminder agent (only honored on Asia's reminder calls)
+const isReminderCall = (req) => req.body?.call?.metadata?.purpose === "asia-reminder";
+app.post("/riya-todo/done", verifyRetell, async (req, res) => {
+  if (!isReminderCall(req)) return res.json({ result: "Not available on this call." });
+  try {
+    const r = await completeTodo(req.body?.args?.item);
+    if (r.done) return res.json({ result: `Crossed off: "${r.item}". ${r.remaining} item(s) left.` });
+    return res.json({ result: r.candidates.length
+      ? `Not sure which one she means. Ask her to pick: ${r.candidates.join(" / ")}`
+      : `No matching item. Her current list: ${r.all.join(" / ")}` });
+  } catch (e) { console.error(e); res.json({ result: "Couldn't update the list right now; tell her it'll be fixed and to text the change instead." }); }
+});
+app.post("/riya-todo/add", verifyRetell, async (req, res) => {
+  if (!isReminderCall(req)) return res.json({ result: "Not available on this call." });
+  try {
+    const r = await addTodo(req.body?.args?.item);
+    res.json({ result: r.duplicate ? `"${r.item}" is already on the list.` : `Added: "${r.item}".` });
+  } catch (e) { console.error(e); res.json({ result: "Couldn't add it right now." }); }
+});
+
+// ---------------------------------------------------------------------------
 // Reminder calls for Asia (Riya calls her and reads her to-do list)
 //   POST /reminder-call   header x-reminder-token: REMINDER_CALL_TOKEN
-//        body {"reminders": "<what Riya should say>", "kind": "daily"|"urgent"}
+//        body {"extra": "<time-sensitive items>", "kind": "daily"|"urgent"}; the to-do list comes from HubSpot
 //   GET  /reminder-call/info   (same header) -> phone numbers + agents, for setup
 // Always calls REMINDER_CALL_TO (Asia's cell) and nobody else.
 // Env: REMINDER_CALL_TOKEN, REMINDER_CALL_TO (+1706...), optional
@@ -1931,7 +2043,7 @@ async function retellApi(method, path, body) {
   if (!r.ok) throw new Error(`Retell ${method} ${path} ${r.status}: ${typeof data === "string" ? data.slice(0, 300) : JSON.stringify(data).slice(0, 300)}`);
   return data;
 }
-const REMINDER_AGENT_NAME = "Riya Reminders (Asia only)";
+const REMINDER_AGENT_NAME = "Riya Reminders v2 (Asia only)";
 let reminderAgentId = process.env.RETELL_REMINDER_AGENT_ID || null;
 
 async function listAll(method, path) {
@@ -1970,22 +2082,40 @@ async function ensureReminderAgent() {
     voiceId = riya?.voice_id;
   }
   if (!voiceId) throw new Error("Could not find a voice to use; set RETELL_REMINDER_VOICE_ID");
+  const base = (process.env.PUBLIC_BASE_URL || `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`).replace(/\/$/, "");
   const llm = await retellApi("POST", "/create-retell-llm", {
     general_prompt:
       "You are Riya, Asia Varner's personal assistant at Honey Drip Network. You are calling Asia (the owner) with her reminders. " +
-      "Be warm, upbeat and brief, like a friendly assistant. Read her these reminders clearly, most urgent first, in plain spoken language " +
-      "(no emojis, no reading of symbols, say addresses naturally):\n\n{{reminders}}\n\n" +
-      "After reading them, ask if she wants you to repeat anything. If she asks, repeat it. If she says thanks, bye, or she's good, " +
-      "say a short goodbye and end the call. Keep the whole call under 2 minutes. If you reach voicemail, leave a short message with the " +
-      "most important one or two reminders and say the full list is in her texts. Never discuss anything else, never share member data.",
+      "Be warm, upbeat and brief. Speak naturally: no emojis, no symbols, say addresses normally.\n\n" +
+      "TODAY'S TIME-SENSITIVE ITEMS (say these first, if any):\n{{extra}}\n\n" +
+      "HER TO-DO LIST:\n{{todos}}\n\n" +
+      "HOW THE CALL GOES:\n" +
+      "1. Mention any time-sensitive items first.\n" +
+      "2. Read her to-do list, briefly.\n" +
+      "3. Ask: \"Have you crossed any of these off yet?\" For EACH item she says is done, call mark_done with her words for it, " +
+      "then confirm it's crossed off. If mark_done says it isn't sure which item, ask her to pick and call it again.\n" +
+      "4. Ask: \"Anything you want me to add?\" For EACH new thing, call add_item with a short, clear to-do (e.g. 'Call the CPA about residency'). Confirm it was added.\n" +
+      "5. When she's done, say a quick upbeat goodbye and call end_call.\n" +
+      "Only change the list when she clearly asks. Keep the call under 4 minutes. " +
+      "If you reach voicemail: leave a short message with the most important one or two items, say the full list is in her texts, and end the call. " +
+      "Never discuss anything else and never share member data.",
     begin_message: "Hey Asia, it's Riya with your reminders. You got a quick minute?",
+    general_tools: [
+      { type: "end_call", name: "end_call", description: "End the call after saying goodbye." },
+      { type: "custom", name: "mark_done", url: `${base}/riya-todo/done`, speak_during_execution: false, speak_after_execution: true,
+        description: "Cross an item off Asia's to-do list when she says it's done.",
+        parameters: { type: "object", properties: { item: { type: "string", description: "The to-do she finished, in her words" } }, required: ["item"] } },
+      { type: "custom", name: "add_item", url: `${base}/riya-todo/add`, speak_during_execution: false, speak_after_execution: true,
+        description: "Add a new item to Asia's to-do list when she asks.",
+        parameters: { type: "object", properties: { item: { type: "string", description: "Short, clear to-do to add" } }, required: ["item"] } },
+    ],
   });
   const agent = await retellApi("POST", "/create-agent", {
     agent_name: REMINDER_AGENT_NAME,
     response_engine: { type: "retell-llm", llm_id: llm.llm_id },
     voice_id: voiceId,
     end_call_after_silence_ms: 20000,
-    max_call_duration_ms: 240000,
+    max_call_duration_ms: 420000,
   });
   return (reminderAgentId = agent.agent_id);
 }
@@ -2015,16 +2145,17 @@ app.post("/reminder-call", async (req, res) => {
   if (!to) return res.status(500).json({ error: "REMINDER_CALL_TO not set" });
   let body = {};
   try { body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString("utf-8") : JSON.stringify(req.body || {})); } catch {}
-  const reminders = String(body.reminders || "").trim().slice(0, 3000);
-  if (!reminders) return res.status(400).json({ error: "reminders is required" });
+  const extra = String(body.extra || body.reminders || "").trim().slice(0, 2000) || "None today.";
   try {
+    const todos = await listTodos();
+    const todoText = todos.length ? todos.map((t, i) => `${i + 1}. ${t.item}`).join("\n") : "Her list is empty right now.";
     const agentId = await ensureReminderAgent();
     const from = await pickFromNumber();
     const call = await retellApi("POST", "/v2/create-phone-call", {
       from_number: from,
       to_number: to,
       override_agent_id: agentId,
-      retell_llm_dynamic_variables: { reminders },
+      retell_llm_dynamic_variables: { extra, todos: todoText },
       metadata: { purpose: "asia-reminder", kind: body.kind || "daily" },
     });
     console.log(`Reminder call placed: ${call.call_id} (${body.kind || "daily"})`);
