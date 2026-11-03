@@ -1802,6 +1802,7 @@ async function syncActiveMembersToSlickText({ mode } = {}) {
   if (!process.env.SLICKTEXT_API_KEY) return { skipped: "SLICKTEXT_API_KEY not set" };
   if (stState.running) return { skipped: "already running" };
   stState.running = true;
+  console.log(`SlickText sync: start (${mode})`);
   const started = Date.now();
   const r = { mode, active: 0, activeWithPhone: 0, ended: 0, toAdd: 0, toRemove: 0, created: 0, added: 0, removed: 0,
               skippedOptedOut: 0, newContacts: 0, lookupErrors: 0, errors: [] };
@@ -1843,7 +1844,11 @@ async function syncActiveMembersToSlickText({ mode } = {}) {
       r.added += ids.length;
       if (r.added % 1000 < 200) console.log(`SlickText sync progress: added ${r.added} of ${r.toAdd}`);
     };
+    let looked = 0;
     for (const phone of sample) {
+      if (mode === "live" && ++looked % 250 === 0) {
+        console.log(`SlickText sync progress: looked up ${looked}/${sample.length}, added ${r.added}, pending ${addIds.length}, created ${r.created}, opted-out ${r.skippedOptedOut}, errors ${r.lookupErrors}${r.errors[0] ? ` (first: ${r.errors[0].slice(0, 160)})` : ""}`);
+      }
       try {
         let c = await findContact(phone);
         if (c && c.optIn !== "subscribed") { r.skippedOptedOut++; continue; }
