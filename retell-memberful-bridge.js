@@ -1728,6 +1728,10 @@ const stState = {
   contactByPhone: new Map(), // +1XXXXXXXXXX -> { id, optIn }
   onList: new Set(),         // phones this process has confirmed on the list
   offList: new Set(),        // phones this process has confirmed removed
+  cancelOn: new Set(),       // phones confirmed on the "Recently cancelled" list
+  cancelOff: new Set(),      // phones confirmed off it
+  cancelListId: Number(process.env.SLICKTEXT_CANCELLED_LIST_ID || 0) || null,
+  lastCancel: null,
   last: null,
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1790,12 +1794,84 @@ async function createContact(phone, m) {
   return out;
 }
 
-async function listChange(method, contactIds) {
+async function listChange(method, contactIds, listId = ST.list) {
   for (let i = 0; i < contactIds.length; i += 100) {
     // SlickText v2 wants one entry per contact: [{ contact_id, lists: [...] }]
-    await slick(method, "/lists/contacts", contactIds.slice(i, i + 100).map((id) => ({ contact_id: id, lists: [ST.list] })));
+    await slick(method, "/lists/contacts", contactIds.slice(i, i + 100).map((id) => ({ contact_id: id, lists: [listId] })));
     await sleep(300);
   }
+}
+
+// ---- "Recently cancelled" list: members whose access ended in the last 90 days ----
+const CANCEL_LIST_NAME = process.env.SLICKTEXT_CANCELLED_LIST_NAME || "Recently cancelled";
+const listIdOf = (l) => Number(l?.contact_list_id ?? l?.list_id ?? l?.id ?? 0) || null;
+async function ensureCancelledList() {
+  if (stState.cancelListId) return stState.cancelListId;
+  const lists = asList(await slick("GET", "/lists?limit=250"));
+  const hit = lists.find((l) => String(l?.name || "").trim().toLowerCase() === CANCEL_LIST_NAME.toLowerCase());
+  if (hit && listIdOf(hit)) return (stState.cancelListId = listIdOf(hit));
+  const created = asList(await slick("POST", "/lists", { name: CANCEL_LIST_NAME }))[0];
+  const id = listIdOf(created);
+  if (!id) throw new Error(`Couldn't create "${CANCEL_LIST_NAME}" list: ${JSON.stringify(created).slice(0, 200)}`);
+  console.log(`SlickText: created list "${CANCEL_LIST_NAME}" (${id})`);
+  return (stState.cancelListId = id);
+}
+
+async function syncCancelledList() {
+  const r = { want: 0, toAdd: 0, toRemove: 0, added: 0, removed: 0, notInSlickText: 0, optedOut: 0, errors: [] };
+  const listId = await ensureCancelledList();
+  r.listId = listId;
+  const now = Date.now() / 1000, d90 = now - 90 * 86400, d180 = now - 180 * 86400;
+  const want = new Set(), aged = new Set(), activePhones = new Set();
+  for (const m of memberIndex.byId.values()) {
+    const phone = toE164US(m.phoneNumber);
+    if (!phone || (m.email || "").toLowerCase().startsWith("test@")) continue;
+    const subs = m.subscriptions || [];
+    if (subs.some((s) => s.active)) { activePhones.add(phone); continue; }
+    const lastEnd = Math.max(0, ...subs.map((s) => s.expiresAt || 0));
+    if (lastEnd > d90 && lastEnd <= now) want.add(phone);
+    else if (lastEnd > d180 && lastEnd <= d90) aged.add(phone);
+  }
+  for (const p of activePhones) { want.delete(p); aged.add(p); } // rejoined -> take off the cancelled list
+  for (const p of want) aged.delete(p);
+  r.want = want.size;
+  const addPhones = [...want].filter((p) => !stState.cancelOn.has(p));
+  // Remove people who aged out (90-180 days) or rejoined. Only those we have a contact id for
+  // (no extra lookups); after a restart the hourly runs catch up as ids get cached.
+  const removePhones = [...aged].filter((p) => !stState.cancelOff.has(p) && stState.contactByPhone.get(p)?.id);
+  r.toAdd = addPhones.length; r.toRemove = removePhones.length;
+
+  const ids = [], phones = [];
+  const flush = async () => {
+    if (!ids.length) return;
+    const i2 = ids.splice(0), p2 = phones.splice(0);
+    await listChange("POST", i2, listId);
+    p2.forEach((p) => { stState.cancelOn.add(p); stState.cancelOff.delete(p); });
+    r.added += i2.length;
+  };
+  for (const phone of addPhones) {
+    try {
+      const c = await findContact(phone); // only existing, subscribed contacts; never creates new ones
+      if (!c) { r.notInSlickText++; stState.cancelOff.add(phone); }
+      else if (c.optIn !== "subscribed") r.optedOut++;
+      else if (c.id) { ids.push(c.id); phones.push(phone); if (ids.length >= 200) await flush(); }
+    } catch (e) { if (r.errors.length < 3) r.errors.push(String(e.message || e)); }
+    await sleep(150);
+  }
+  await flush();
+  const rm = [];
+  for (const phone of removePhones) {
+    const c = stState.contactByPhone.get(phone);
+    if (c?.id) rm.push([phone, c.id]);
+  }
+  if (rm.length) {
+    try {
+      await listChange("DELETE", rm.map((x) => x[1]), listId);
+      r.removed = rm.length;
+    } catch (e) { if (r.errors.length < 3) r.errors.push(String(e.message || e)); }
+    rm.forEach(([p]) => { stState.cancelOff.add(p); stState.cancelOn.delete(p); });
+  }
+  return r;
 }
 
 async function syncActiveMembersToSlickText({ mode } = {}) {
@@ -1889,6 +1965,8 @@ async function syncActiveMembersToSlickText({ mode } = {}) {
         removeIds.forEach(([p]) => { stState.offList.add(p); stState.onList.delete(p); });
         r.removed = removeIds.length;
       }
+      try { r.cancelled = await syncCancelledList(); stState.lastCancel = r.cancelled; }
+      catch (e) { r.cancelled = { error: String(e.message || e) }; }
     }
   } catch (e) {
     r.errors.push(String(e.message || e));
