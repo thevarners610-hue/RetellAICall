@@ -1835,6 +1835,14 @@ async function syncActiveMembersToSlickText({ mode } = {}) {
     // Dry run: check the API works on a small sample, change nothing
     const sample = mode === "dry" ? addPhones.slice(0, 15) : addPhones;
     const addIds = [], addedPhones = [];
+    const flushAdds = async () => {
+      if (!addIds.length) return;
+      const ids = addIds.splice(0), phones = addedPhones.splice(0);
+      await listChange("POST", ids);
+      phones.forEach((p) => { stState.onList.add(p); stState.offList.delete(p); });
+      r.added += ids.length;
+      if (r.added % 1000 < 200) console.log(`SlickText sync progress: added ${r.added} of ${r.toAdd}`);
+    };
     for (const phone of sample) {
       try {
         let c = await findContact(phone);
@@ -1846,6 +1854,8 @@ async function syncActiveMembersToSlickText({ mode } = {}) {
           r.created++;
         }
         if (c?.id) { addIds.push(c.id); addedPhones.push(phone); }
+        // Live: add in batches so progress survives a restart
+        if (mode === "live" && addIds.length >= 200) await flushAdds();
       } catch (e) {
         r.lookupErrors++;
         if (r.errors.length < 5) r.errors.push(String(e.message || e));
@@ -1855,11 +1865,7 @@ async function syncActiveMembersToSlickText({ mode } = {}) {
     }
 
     if (mode === "live") {
-      if (addIds.length) {
-        await listChange("POST", addIds);
-        addedPhones.forEach((p) => { stState.onList.add(p); stState.offList.delete(p); });
-        r.added = addIds.length;
-      }
+      await flushAdds();
       const removeIds = [];
       for (const phone of removePhones) {
         try {
