@@ -2167,7 +2167,7 @@ async function ensureReminderAgent() {
     voice_id: voiceId,
     end_call_after_silence_ms: 20000,
     enable_voicemail_detection: true,
-    voicemail_message: "Hey Asia, it's Riya with your reminders. I'll try you again in about 30 minutes, and your full list is in your texts. Talk soon!",
+    voicemail_message: "Hey Asia, it's Riya with your reminders. Sorry I missed you! Your full list is in your texts, and you can reply done or add to update it. Talk soon!",
     max_call_duration_ms: 420000,
   });
   return (reminderAgentId = agent.agent_id);
