@@ -1941,6 +1941,7 @@ async function listTodos() {
 
 async function addTodo(item) {
   item = String(item || "").trim().slice(0, 200);
+  item = item.charAt(0).toUpperCase() + item.slice(1);
   if (!item) throw new Error("empty item");
   const existing = await listTodos();
   const dup = existing.find((t) => t.item.toLowerCase() === item.toLowerCase());
@@ -2000,6 +2001,56 @@ app.post("/reminder-list/done", async (req, res) => {
   if (!todoAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
   try { res.json(await completeTodo(bodyJson(req).item)); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Asia texting Riya to update her list (called by the Zapier "Asia → Riya to-do texts" Zap,
+// which only fires for Asia's own number). Body {message}. Returns {reply} to text back.
+//   "done 2" / "done 2, 5" / "done channing" / "called channing" / "finished the fiverr thing"
+//   "add call the bank" / "new ..." / "remind me to ..."
+//   "list" / "?"  -> current list
+async function handleTodoText(msg) {
+  const raw = String(msg || "").trim();
+  const t = raw.toLowerCase();
+  const fmt = (items) => items.length ? items.map((x, i) => `${i + 1}. ${x.item}`).join("\n") : "(nothing left 🎉)";
+  if (!t || /^(list|todo|to-do|to do|\?|what'?s (on )?my list)\b/.test(t)) {
+    const todos = await listTodos();
+    return `📝 Your list:\n${fmt(todos)}\n\nReply "done 2" or "add ..." to update.`;
+  }
+  const addM = raw.match(/^\s*(?:add|new|remind me to|put)\s*[:\-]?\s*(.+)$/i);
+  if (addM) {
+    const items = addM[1].split(/\n|;/).map((s) => s.trim()).filter(Boolean);
+    const out = [];
+    for (const it of items) out.push(await addTodo(it.replace(/\s+(to|on) (my|the) list$/i, "")));
+    const todos = await listTodos();
+    return `➕ Added: ${out.map((o) => `"${o.item}"${o.duplicate ? " (already there)" : ""}`).join(", ")}\n\n📝 Your list:\n${fmt(todos)}`;
+  }
+  // done ...  (numbers or words)
+  const doneM = raw.match(/^\s*(?:done|did|finished|completed|complete|crossed off|cross off|check off|checked off|x)\b\s*[:\-]?\s*(.*)$/i);
+  const target = doneM ? doneM[1] : raw;
+  const todos = await listTodos();
+  const nums = target.match(/^\s*#?\d+(\s*(,|and|&|\s)\s*#?\d+)*\s*$/) ? target.match(/\d+/g).map(Number) : null;
+  if (nums) {
+    const picks = [...new Set(nums)].map((n) => todos[n - 1]).filter(Boolean);
+    if (!picks.length) return `Hmm, I don't see that number. 📝 Your list:\n${fmt(todos)}`;
+    for (const p of picks) await hubspot("PATCH", `/crm/v3/objects/tasks/${p.id}`, { properties: { hs_task_status: "COMPLETED" } });
+    const left = await listTodos();
+    return `✅ Crossed off: ${picks.map((p) => `"${p.item}"`).join(", ")}\n\n📝 Still on your list:\n${fmt(left)}`;
+  }
+  const { best, scored } = matchTodo(todos, target);
+  if (best && (doneM || /\b(did|done|called|sent|finished|registered|transferred|talked|emailed|checked|handled|took care)\b/i.test(raw))) {
+    await hubspot("PATCH", `/crm/v3/objects/tasks/${best.id}`, { properties: { hs_task_status: "COMPLETED" } });
+    const left = await listTodos();
+    return `✅ Crossed off: "${best.item}"\n\n📝 Still on your list:\n${fmt(left)}`;
+  }
+  if (doneM && scored.length) {
+    return `Which one? Reply "done" + the number:\n${fmt(todos)}`;
+  }
+  return `I didn't catch that 🙈 Reply "done 2" (or "done channing") to cross off, "add ..." to add, or "list" to see it.\n\n📝 Your list:\n${fmt(todos)}`;
+}
+app.post("/reminder-list/text", async (req, res) => {
+  if (!todoAuthOk(req)) return res.status(401).json({ error: "unauthorized" });
+  try { res.json({ reply: (await handleTodoText(bodyJson(req).message)).slice(0, 900) }); }
+  catch (e) { console.error(e); res.json({ reply: "Sorry, I couldn't update your list right now. Try again in a bit." }); }
 });
 
 // Retell custom functions for the reminder agent (only honored on Asia's reminder calls)
