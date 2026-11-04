@@ -25,6 +25,9 @@ import crypto from "node:crypto";
 import express from "express";
 import Retell from "retell-sdk";
 
+// retell-sdk v6 verify() needs the Web Crypto API on globalThis (missing on Node 18)
+if (!globalThis.crypto) globalThis.crypto = crypto.webcrypto;
+
 const app = express();
 // Raw body so Retell signature verification is exact
 app.use(express.raw({ type: "application/json" }));
